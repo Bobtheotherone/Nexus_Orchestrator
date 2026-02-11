@@ -1,0 +1,37 @@
+# tools/registry.toml — tool allowlist and version pinning
+#
+# File: tools/registry.toml
+# Last updated: 2026-02-11
+#
+# Purpose
+# - Curated list of approved tools and pinned versions for deterministic installs inside sandboxes.
+#
+# What should be included
+# - Tool entries with pinned versions (and ideally hashes) plus provenance (PyPI, apt, github release).
+# - Risk classification (low/medium/high) to drive sandbox policies.
+# - License notes if relevant.
+#
+# Functional requirements
+# - Tool Provisioner must be able to read this file and install tools reproducibly.
+# - Changes must be audited in the evidence ledger (who/why/when).
+#
+# Tool allowlist — pinned versions for reproducibility
+# Add entries as agents request new tools.
+
+# [tool.ruff]
+# version = "0.4.0"
+# source = "pypi"
+# checksum = ""
+# risk = "low"
+
+# [tool.mypy]
+# version = "1.8.0"
+# source = "pypi"
+# checksum = ""
+# risk = "low"
+
+# [tool.pytest]
+# version = "8.0.0"
+# source = "pypi"
+# checksum = ""
+# risk = "low"

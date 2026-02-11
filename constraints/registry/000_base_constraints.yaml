@@ -1,0 +1,162 @@
+# 000_base_constraints.yaml — seed constraint set (baseline)
+#
+# File: constraints/registry/000_base_constraints.yaml
+# Last updated: 2026-02-11
+#
+# Purpose
+# - Defines the initial always-on constraints for the orchestrator *itself* and for orchestrated projects.
+# - This file is intentionally small: it encodes the non-negotiables ("must") and a few "should" defaults.
+#
+# What should be included
+# - Constraint records with unique IDs (e.g., CON-SEC-0001) and stable semantics over time.
+# - Fields: id, severity (must/should/may), category, description, checker, parameters, requirement_links, source.
+# - Clear mapping to checker implementations (verification_plane/checkers/*).
+#
+# Functional requirements
+# - Must be machine-parseable (YAML) and validated via schema.
+# - Must be versioned; changes require an ADR if semantics change.
+#
+# Non-functional requirements
+# - Constraints must be deterministic and evidence-producing.
+# - Keep false positives low; provide allowlists and parameters rather than disabling checks.
+#
+# NOTE
+# - The entries below are *seed defaults* for bootstrapping. They are expected to evolve via the "Never Again" system.
+#
+# Base constraints — always active, foundational rules
+# These are the minimum constraints for any orchestrator run.
+
+- id: CON-SEC-0001
+  severity: must
+  category: security
+  description: "No secrets (API keys, passwords, tokens) in source files or log output"
+  checker: security_checker
+  parameters:
+    scan_type: secret_patterns
+    patterns: ["API_KEY", "SECRET", "PASSWORD", "TOKEN", "PRIVATE_KEY"]
+    exclude_paths: [".env.example"]
+  requirement_links: []
+  source: manual
+
+- id: CON-ARC-0001
+  severity: must
+  category: structural
+  description: "No file modifications outside declared work item scope"
+  checker: scope_checker
+  parameters: {}
+  requirement_links: []
+  source: manual
+
+- id: CON-COR-0001
+  severity: must
+  category: correctness
+  description: "All submitted artifacts must compile/parse without errors"
+  checker: build_checker
+  parameters: {}
+  requirement_links: []
+  source: manual
+
+- id: CON-COR-0002
+  severity: must
+  category: correctness
+  description: "All submitted tests must pass"
+  checker: test_checker
+  parameters:
+    test_type: unit
+  requirement_links: []
+  source: manual
+
+- id: CON-COR-0003
+  severity: must
+  category: correctness
+  description: "All public functions must have at least one test"
+  checker: test_checker
+  parameters:
+    test_type: coverage
+    min_coverage_percent: 80
+  requirement_links: []
+  source: manual
+
+- id: CON-STY-0001
+  severity: must
+  category: style
+  description: "Code passes linter with zero errors"
+  checker: lint_checker
+  parameters: {}
+  requirement_links: []
+  source: manual
+
+- id: CON-STY-0002
+  severity: must
+  category: style
+  description: "Code passes formatter check"
+  checker: lint_checker
+  parameters:
+    check_type: format
+  requirement_links: []
+  source: manual
+
+- id: CON-SEC-0002
+  severity: must
+  category: security
+  description: "No dependencies with known critical vulnerabilities"
+  checker: security_checker
+  parameters:
+    scan_type: dependency_audit
+    severity_threshold: critical
+  requirement_links: []
+  source: manual
+
+- id: CON-DOC-0001
+  severity: should
+  category: documentation
+  description: "Public API changes require updated documentation"
+  checker: documentation_checker
+  parameters: {}
+  requirement_links: []
+  source: manual
+
+- id: CON-REL-0001
+  severity: should
+  category: reliability
+  description: "Every external call has a timeout and retry policy"
+  checker: reliability_checker
+  parameters: {}
+  requirement_links: []
+  source: manual
+
+- id: CON-REG-0001
+  severity: must
+  category: structural
+  description: "Constraint registry must validate against its schema and invariants"
+  checker: schema_checker
+  parameters:
+    target_kind: constraint_registry
+    registry_path: "constraints/registry/"
+    schema_path: "docs/schemas/constraint_registry.schema.jsonc"
+  requirement_links: []
+  source: manual
+
+- id: CON-CONF-0001
+  severity: must
+  category: structural
+  description: "Orchestrator runtime configuration must validate against schema"
+  checker: schema_checker
+  parameters:
+    target_kind: orchestrator_config
+    config_path: "orchestrator.toml"
+    schema_path: "docs/schemas/config.schema.jsonc"
+  requirement_links: []
+  source: manual
+
+- id: CON-EVI-0001
+  severity: should
+  category: audit
+  description: "Evidence ledger records must validate against schema (integrity + completeness)"
+  checker: schema_checker
+  parameters:
+    target_kind: evidence_ledger
+    ledger_path: "state/"  # where evidence index/ledger references live (implementation-defined)
+    schema_path: "docs/schemas/evidence_ledger.schema.jsonc"
+  requirement_links: []
+  source: manual

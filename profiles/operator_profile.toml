@@ -1,0 +1,45 @@
+# operator_profile.toml — personalization profile (example)
+#
+# File: profiles/operator_profile.toml
+# Last updated: 2026-02-11
+#
+# Purpose
+# - Encode your preferences as structured data so the orchestrator can:
+#   - bias planning/decomposition
+#   - bias provider/model routing
+#   - bias tool selection and dependency policy
+#   - apply consistent style/architecture expectations
+#
+# Rules
+# - NO secrets here (no API keys).
+# - Preferences should never weaken 'must' constraints.
+#
+[profile]
+name = "default"
+owner = "private"
+version = 1
+
+[preferences]
+# Preferred implementation language(s) for the orchestrator itself
+preferred_languages = ["python"]
+# Preferred UI style: "cli" | "tui" | "web" (web optional)
+preferred_ui = "cli"
+# Strong opinions / house rules
+house_rules = [
+  "Prefer small, composable modules over frameworks.",
+  "No network egress from sandboxes unless explicitly allowlisted.",
+  "Everything must be reproducible; record tool versions and hashes.",
+]
+
+[dependency_policy]
+# "strict" rejects most deps; "balanced" allows common tooling; "permissive" allows more
+risk_tolerance = "balanced"
+# Examples of allow/deny lists (implementer will define semantics)
+denylist = ["*telemetry*", "*tracking*"]
+prefer_stdlib_over_deps = true
+
+[routing_preferences]
+# Bias towards provider/model for certain roles (the router can override on repeated failures)
+architect_preference = "anthropic"
+implementer_preference = "openai"
+reviewer_preference = "anthropic"

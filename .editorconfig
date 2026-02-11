@@ -1,0 +1,27 @@
+# .editorconfig — formatting conventions
+#
+# File: .editorconfig
+# Last updated: 2026-02-11
+#
+# Purpose
+# - Provide consistent formatting defaults across editors to reduce diffs and merge noise.
+#
+# What should be included
+# - Charset, newline, indentation rules.
+# - Special cases for YAML/TOML/Markdown/Python.
+#
+root = true
+
+[*]
+end_of_line = lf
+insert_final_newline = true
+charset = utf-8
+indent_style = space
+indent_size = 2
+
+[*.py]
+indent_size = 4
+max_line_length = 100
+
+[*.md]
+trim_trailing_whitespace = false

@@ -1,0 +1,94 @@
+# pyproject.toml — Python project metadata & tool config (private-first)
+#
+# File: pyproject.toml
+# Last updated: 2026-02-11
+#
+# Purpose
+# - Define the orchestrator as a local, developer-run tool.
+# - Centralize dependency groups and tool configuration for reproducible development.
+#
+# What should be included
+# - Minimal core dependencies for the orchestrator runtime.
+# - Optional extras for providers (OpenAI/Anthropic), sandboxing (docker), and UI (TUI).
+# - Dev tooling: formatter, linter, type checker, test runner, coverage, security scanners.
+# - Entry point for CLI (e.g., `nexus`).
+#
+# Functional requirements
+# - Must support editable installs (`pip install -e .`) for rapid local iteration.
+# - Must separate provider deps to allow running without vendor SDKs (mock mode).
+#
+# Non-functional requirements
+# - Prefer fewer dependencies; this is a private tool, not a platform.
+# - Pin or constrain versions to avoid silent breaking changes.
+#
+[project]
+name = "nexus-orchestrator"
+version = "0.1.0"
+description = "Constraint-driven agentic LLM orchestrator — personal, local-first"
+requires-python = ">=3.11"
+readme = "README.md"
+license = {text = "MIT"}
+
+dependencies = [
+    # Core (keep minimal)
+    # "tomli>=2.0;python_version<'3.11'",  # stdlib in 3.11+
+    # "pydantic>=2.0",           # data validation and serialization
+    # "aiosqlite>=0.19",         # async SQLite for state DB
+    # "gitpython>=3.1",          # Git operations
+    # "jinja2>=3.1",             # prompt template rendering
+    # "structlog>=23.0",         # structured logging
+    # "rich>=13.0",              # CLI output formatting
+    # "ulid-py>=1.1",            # ULID generation for IDs
+]
+
+[project.optional-dependencies]
+providers = [
+    # "openai>=1.0",             # OpenAI/Codex adapter
+    # "anthropic>=0.30",         # Anthropic/Claude adapter
+]
+dev = [
+    "hypothesis>=6.136.0,<7",
+    "mypy>=1.19.1,<2",
+    "pytest>=9.0.2,<10",
+    "pytest-asyncio>=1.2.0,<2",
+    "ruff>=0.14.13,<0.15",
+]
+tui = [
+    # "textual>=0.50",           # TUI framework
+]
+
+[project.scripts]
+nexus = "nexus_orchestrator.main:cli_entrypoint"
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "N", "UP", "B", "A", "SIM", "TCH"]
+ignore = ["E501"]
+
+[tool.ruff.lint.per-file-ignores]
+"scripts/repo_audit.py" = ["E402"]
+"tests/meta/test_repo_blueprint_contracts.py" = ["E402"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+warn_return_any = true
+warn_unused_configs = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+

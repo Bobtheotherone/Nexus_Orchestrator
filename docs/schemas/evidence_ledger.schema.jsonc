@@ -1,0 +1,36 @@
+// evidence_ledger.schema.jsonc — JSON Schema (JSONC) placeholder
+//
+// File: docs/schemas/evidence_ledger.schema.jsonc
+// Last updated: 2026-02-11
+//
+// Purpose
+// - Machine-readable schema for evidence ledger entries recorded per work item and per merge.
+//
+// What should be included
+// - Definitions for EvidenceRecord, CheckRun, ArtifactHashes, ToolVersions, Environment capture.
+// - Invariants: required timestamps, stable IDs, hash algorithms allowed, retention policy metadata.
+//
+// NOTE
+// - This schema is intentionally minimal in the skeleton. Fill it in during implementation.
+// - Keep schemas strict; prefer explicit enums and 'additionalProperties: false'.
+{
+  "title": "Evidence Ledger Schema",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {
+      "description": "TODO",
+      "type": ["object", "array", "string", "number", "boolean", "null"]
+    },
+    "runs": {
+      "description": "TODO",
+      "type": ["object", "array", "string", "number", "boolean", "null"]
+    },
+    "records": {
+      "description": "TODO",
+      "type": ["object", "array", "string", "number", "boolean", "null"]
+    }
+  },
+  "required": []
+}

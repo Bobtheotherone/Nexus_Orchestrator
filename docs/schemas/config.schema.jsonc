@@ -1,0 +1,16 @@
+// config.schema.jsonc (placeholder)
+//
+// Purpose:
+// - Machine-readable schema for orchestrator.toml after it is normalized to JSON for validation.
+//
+// Requirements:
+// - JSON Schema draft selection must be recorded (ADR).
+// - Include schemaVersion field and backwards compatibility policy.
+// - Keep comments to explain tricky fields; keep the schema strict.
+//
+// NOTE:
+// - This skeleton intentionally omits the actual schema to avoid pseudo-code; add fields when implementing.
+{
+  "title": "NEXUS Orchestrator Config Schema (placeholder)",
+  "type": "object"
+}

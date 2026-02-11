@@ -1,0 +1,60 @@
+# CI workflow — orchestrator repo (local-first)
+#
+# File: .github/workflows/ci.yml
+# Last updated: 2026-02-11
+#
+# Purpose
+# - Provide fast, deterministic feedback for changes to the orchestrator itself.
+# - Enforce baseline quality gates *without* turning this repo into a distributable SaaS product.
+#
+# What should be included in this workflow
+# - Jobs for: lint/format, typecheck, unit tests, integration tests, smoke tests (mocked providers).
+# - Schema validation for: orchestrator config, constraint registry, evidence ledger.
+# - Caching for Python deps to keep runtime low on a single workstation CI runner.
+#
+# Functional requirements
+# - Must NOT require real provider API keys; all CI must run with mocks/fakes.
+# - Must fail the PR on must-severity constraint violations for this repo (style/type/tests/security checks).
+# - Must publish minimal artifacts (logs, coverage) to aid debugging.
+#
+# Non-functional requirements
+# - Keep runtime reasonable (target: < 10 minutes on GitHub-hosted runners).
+# - Deterministic outputs (pin tool versions; avoid time-dependent snapshots unless fixed).
+# - Avoid flaky tests; quarantine flakes immediately.
+#
+# CI pipeline for the orchestrator repo itself
+name: CI
+
+on:
+  push:
+    branches: [main, integration]
+  pull_request:
+
+# Requirements:
+# - Fast job: lint + typecheck (<2 min)
+# - Test job: unit + integration with mocked providers (<5 min)
+# - No GPU required in CI; GPU tests are optional/mocked
+# - Cache dependencies aggressively
+# - Deterministic: mirrors local constraint gate
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # - uses: actions/setup-python@v5
+      #   with: { python-version: '3.11' }
+      # - run: pip install -e ".[dev]"
+      # - run: ruff check src/ tests/
+      # - run: ruff format --check src/ tests/
+      # - run: mypy src/nexus_orchestrator/
+
+  test:
+    runs-on: ubuntu-latest
+    needs: lint
+    steps:
+      - uses: actions/checkout@v4
+      # - uses: actions/setup-python@v5
+      #   with: { python-version: '3.11' }
+      # - run: pip install -e ".[dev,providers]"
+      # - run: pytest tests/unit/ tests/integration/ -v --cov

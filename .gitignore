@@ -1,0 +1,37 @@
+# .gitignore — local artifacts to exclude from Git
+#
+# File: .gitignore
+# Last updated: 2026-02-11
+#
+# Purpose
+# - Keep ephemeral artifacts (caches, workspaces, evidence bundles) out of version control.
+#
+# What should be included
+# - Python build artifacts, virtualenvs, caches.
+# - Orchestrator-specific: workspaces/, evidence outputs (optionally), logs/, .cache/.
+# - State DB file(s) if you treat state as local (recommended for private usage).
+#
+# Non-functional requirements
+# - Do NOT ignore the source-of-truth constraint registry or docs.
+# - Prefer ignoring generated evidence artifacts while keeping schema/docs committed.
+#
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.hypothesis/
+.cache/
+state/
+workspaces/
+evidence/
+artifacts/
+*.log
+*.sqlite
+*.db
+.env
+dist/
+*.egg-info/
+.coverage
+htmlcov/

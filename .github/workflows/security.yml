@@ -1,0 +1,45 @@
+# Security workflow — orchestrator repo (local-first)
+#
+# File: .github/workflows/security.yml
+# Last updated: 2026-02-11
+#
+# Purpose
+# - Catch secrets, vulnerable dependencies, and basic supply-chain issues early.
+#
+# What should be included
+# - Secret scanning (patterns + entropy checks) with explicit allowlist for .env.example.
+# - Dependency vulnerability scanning (pip-audit, osv-scanner, etc.) with pinned tool versions.
+# - Optional SAST/lint rules for common Python security footguns.
+# - License scanning (optional, depending on policy).
+#
+# Functional requirements
+# - Must run without privileged credentials.
+# - Must treat newly introduced secrets as a hard failure.
+# - Must treat critical/high vulns as a hard failure (configurable).
+#
+# Non-functional requirements
+# - Keep false positives manageable via documented allowlists.
+# - Produce machine-readable reports (SARIF/JSON) where feasible.
+#
+# Security scanning
+name: Security
+
+on:
+  push:
+    branches: [main]
+  schedule:
+    - cron: '0 6 * * 1'  # Weekly Monday 6am
+
+# Requirements:
+# - Secret scanning on diffs
+# - Dependency vulnerability scanning
+# - Must fail on high-severity findings
+# - Must not leak secrets in logs
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # - run: pip-audit  # or safety check
+      # - run: gitleaks detect --source .

@@ -1,0 +1,138 @@
+# orchestrator.toml — runtime configuration (private workstation)
+#
+# File: orchestrator.toml
+# Last updated: 2026-02-11
+#
+# Purpose
+# - Single source of configuration for local runs: providers, routing, budgets, resources, sandbox policy, paths, and UI.
+#
+# What should be included
+# - Provider configs (OpenAI/Anthropic/local) referencing environment variables for secrets.
+# - Routing policies: which role/task goes to which model/provider; escalation ladder.
+# - Resource governor thresholds matching your hardware envelope (CPU/RAM/Disk/GPU).
+# - Verification policies (risk tiers → required stages).
+# - Git coordination settings (branch prefixes, merge queue rules).
+# - Personalization profile settings (your house rules, preferred stack, dependency policy).
+#
+# Functional requirements
+# - MUST NOT contain secrets; only env var names.
+# - Must support profile overrides (e.g., exploration vs hardening).
+#
+# Non-functional requirements
+# - Keep defaults safe and deterministic.
+# - Be human-editable and easy for agents to parse.
+#
+# orchestrator.toml — runtime configuration
+# This is the single source of config. Env vars override with NEXUS_ prefix.
+# Secrets are NEVER stored here — reference env var names only.
+
+[meta]
+schema_version = 1
+
+# ---------- Provider Routing ----------
+[providers]
+default = "anthropic"  # "openai" | "anthropic" | "local"
+
+[providers.openai]
+api_key_env = "NEXUS_OPENAI_API_KEY"
+# model_code = "gpt-4.1"         # default model for Codex-class tasks
+# model_architect = "o3"          # model for architect role
+# max_concurrent = 20             # concurrent API sessions
+# requests_per_minute = 60
+
+[providers.anthropic]
+api_key_env = "NEXUS_ANTHROPIC_API_KEY"
+# model_code = "claude-sonnet-4-5-20250929"
+# model_architect = "claude-opus-4-6"
+# max_concurrent = 10
+# requests_per_minute = 30
+
+# ---------- Resource Governor ----------
+[resources]
+# CPU cores reserved for orchestrator (rest available for verification)
+orchestrator_cores = 2
+# Max concurrent heavy verification jobs (build + full test)
+max_heavy_verification = 3
+# Max concurrent light verification jobs (lint, format, typecheck)
+max_light_verification = 8
+# RAM headroom to always keep free (bytes)
+ram_headroom_mb = 6144  # 6 GB
+# Disk free minimum before aggressive GC (bytes)
+disk_min_free_gb = 100
+# GPU: reserve for project needs, not orchestrator
+gpu_reserved_for_project = true
+
+# ---------- Budgets ----------
+[budgets]
+# Per work-item defaults (overridable per role)
+max_iterations = 5
+max_tokens_per_attempt = 32000
+max_cost_per_work_item_usd = 2.00
+# Per run
+# max_total_cost_usd = 100.00
+
+# ---------- Git ----------
+[git]
+main_branch = "main"
+integration_branch = "integration"
+contract_branch_prefix = "contract/"
+work_branch_prefix = "work/"
+verify_branch_prefix = "verify/"
+# Auto-resolve trivial conflicts (import ordering, formatting)
+auto_resolve_trivial = true
+
+# ---------- Sandbox ----------
+[sandbox]
+# Backend: "docker" | "podman" | "none" (direct execution, less safe)
+backend = "docker"
+# Default network policy: "deny" | "allowlist" | "logged_permissive"
+network_policy = "deny"
+# Filesystem: workspaces get RW, dependency caches get RO
+# Tool installs require vulnerability scan
+require_tool_vuln_scan = true
+
+# ---------- Paths ----------
+[paths]
+workspace_root = "workspaces/"
+evidence_root = "evidence/"
+state_db = "state/nexus.sqlite"
+constraint_registry = "constraints/registry/"
+constraint_libraries = "constraints/libraries/"
+cache_dir = ".cache/"
+tool_registry = "tools/registry.toml"
+
+# ---------- Observability ----------
+[observability]
+log_level = "INFO"  # DEBUG | INFO | WARNING | ERROR
+log_format = "json"
+log_dir = "logs/"
+# Redact secrets from all log output
+redact_secrets = true
+# Evidence retention: keep last N full runs, summaries forever
+evidence_retention_full_runs = 5
+evidence_retention_failures_days = 90
+
+# ---------- Personalization (private operator profile) ----------
+[personalization]
+enabled = true
+# Path to your operator profile (preferences → planning/routing/constraints defaults)
+profile_path = "profiles/operator_profile.toml"
+# If true, the orchestrator may learn/update preferences over time (recorded in state DB)
+learning_enabled = true
+# If false, personalization affects *planning/routing* but never relaxes must constraints
+may_relax_should_constraints = false
+
+
+# ---------- Profiles ----------
+# Activate with: nexus run --profile hardening
+[profiles.strict]
+sandbox.network_policy = "deny"
+budgets.max_iterations = 3
+
+[profiles.exploration]
+budgets.max_iterations = 8
+# budgets.max_total_cost_usd = 200.00
+
+[profiles.hardening]
+budgets.max_iterations = 3
+# Focus on test/security/perf roles

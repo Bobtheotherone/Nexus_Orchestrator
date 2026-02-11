@@ -1,0 +1,39 @@
+// spec_map.schema.jsonc — JSON Schema (JSONC) placeholder
+//
+// File: docs/schemas/spec_map.schema.jsonc
+// Last updated: 2026-02-11
+//
+// Purpose
+// - Schema for the normalized Spec Map produced by Spec Ingestor (requirements ledger + extracted entities).
+//
+// What should be included
+// - Definitions for Requirement, AcceptanceCriteria, NonFunctionalRequirement, Entities, Interfaces, Risks.
+//
+// NOTE
+// - This schema is intentionally minimal in the skeleton. Fill it in during implementation.
+// - Keep schemas strict; prefer explicit enums and 'additionalProperties: false'.
+{
+  "title": "Spec Map Schema",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {
+      "description": "TODO",
+      "type": ["object", "array", "string", "number", "boolean", "null"]
+    },
+    "requirements": {
+      "description": "TODO",
+      "type": ["object", "array", "string", "number", "boolean", "null"]
+    },
+    "entities": {
+      "description": "TODO",
+      "type": ["object", "array", "string", "number", "boolean", "null"]
+    },
+    "acceptance_criteria": {
+      "description": "TODO",
+      "type": ["object", "array", "string", "number", "boolean", "null"]
+    }
+  },
+  "required": []
+}

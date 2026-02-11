@@ -1,0 +1,33 @@
+// constraint_registry.schema.jsonc — JSON Schema (JSONC) placeholder
+//
+// File: docs/schemas/constraint_registry.schema.jsonc
+// Last updated: 2026-02-11
+//
+// Purpose
+// - Machine-readable schema for constraints/registry/*.yaml entries after YAML->JSON normalization.
+//
+// What should be included
+// - Definitions for Constraint, Severity, Category, CheckerBinding, Parameters, Requirement links.
+// - Validation rules: id format, uniqueness, allowed categories, severity enums, required fields.
+// - Support for future extension fields with explicit versioning.
+//
+// NOTE
+// - This schema is intentionally minimal in the skeleton. Fill it in during implementation.
+// - Keep schemas strict; prefer explicit enums and 'additionalProperties: false'.
+{
+  "title": "Constraint Registry Schema",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {
+      "description": "TODO",
+      "type": ["object", "array", "string", "number", "boolean", "null"]
+    },
+    "constraints": {
+      "description": "TODO",
+      "type": ["object", "array", "string", "number", "boolean", "null"]
+    }
+  },
+  "required": []
+}
