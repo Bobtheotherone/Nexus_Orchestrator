@@ -47,7 +47,9 @@ test-smoke: ## Run smoke tests (end-to-end with mocks)
 	$(PYTHON) -m pytest tests/smoke/ -v
 
 security-scan: ## Vulnerability scan of the current environment (best effort offline if cache exists)
-	$(PYTHON) -m pip_audit --skip-editable --progress-spinner off
+	mkdir -p .security-reports
+	$(PYTHON) -m pip freeze --all --exclude-editable > .security-reports/frozen-requirements.txt
+	$(PYTHON) -m pip_audit --strict --no-deps --progress-spinner off --format json --output .security-reports/pip-audit.json -r .security-reports/frozen-requirements.txt
 
 audit: lint typecheck test security-scan ## Run CI-style quality and security gates
 

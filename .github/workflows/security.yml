@@ -70,6 +70,10 @@ jobs:
       - name: Prepare security reports
         run: mkdir -p .security-reports
 
+      - name: Freeze dependencies for strict audit
+        run: |
+          python -m pip freeze --all --exclude-editable > .security-reports/frozen-requirements.txt
+
       - name: Run gitleaks on introduced commits (push)
         if: github.event_name == 'push' && github.event.before != '0000000000000000000000000000000000000000'
         run: |
@@ -127,10 +131,11 @@ jobs:
         run: |
           python -m pip_audit \
             --strict \
-            --skip-editable \
+            --no-deps \
             --progress-spinner off \
             --format json \
-            --output .security-reports/pip-audit.json
+            --output .security-reports/pip-audit.json \
+            -r .security-reports/frozen-requirements.txt
 
       - name: Upload security reports on failure
         if: failure()

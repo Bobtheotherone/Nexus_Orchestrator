@@ -419,6 +419,17 @@ def test_meta_3_security_workflow_contract() -> None:
         "pip-audit" in uses.lower() for uses in uses_entries
     )
     assert pip_audit_present, "Security workflow must include a pip-audit step."
+    assert any(
+        _invokes_tool(command, "pip")
+        and re.search(r"\bpip\s+freeze\b", command)
+        and "--all" in command
+        and "--exclude-editable" in command
+        and ".security-reports/frozen-requirements.txt" in command
+        for command in commands
+    ), (
+        "Security workflow must freeze dependencies with --all --exclude-editable to "
+        ".security-reports/frozen-requirements.txt."
+    )
     strict_pip_audit_commands = [
         command
         for command in commands
@@ -426,8 +437,25 @@ def test_meta_3_security_workflow_contract() -> None:
     ]
     assert strict_pip_audit_commands, "Security workflow pip_audit command must include --strict."
     for command in strict_pip_audit_commands:
-        assert "--skip-editable" in command, (
-            "Security workflow pip_audit commands using --strict must also use --skip-editable."
+        assert "--no-deps" in command, (
+            "Security workflow strict pip_audit command must include --no-deps."
+        )
+        assert re.search(
+            r"(?:^|\s)(?:-r|--requirement)\s+\.security-reports/frozen-requirements\.txt(?:\s|$)",
+            command,
+        ), (
+            "Security workflow strict pip_audit command must use "
+            "-r .security-reports/frozen-requirements.txt."
+        )
+        assert re.search(r"(?:^|\s)--format\s+json(?:\s|$)", command), (
+            "Security workflow strict pip_audit command must emit JSON format."
+        )
+        assert re.search(
+            r"(?:^|\s)(?:-o|--output)\s+\.security-reports/pip-audit\.json(?:\s|$)",
+            command,
+        ), (
+            "Security workflow strict pip_audit command must output to "
+            ".security-reports/pip-audit.json."
         )
     secret_scan_tokens = ("gitleaks", "trufflehog", "detect-secrets", "secretlint", "ggshield")
     secret_scan_present = any(
