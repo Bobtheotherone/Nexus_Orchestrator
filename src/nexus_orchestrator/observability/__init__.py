@@ -1,18 +1,47 @@
-"""
-nexus-orchestrator — module skeleton
+"""Public observability primitives: structured logging, metrics, and event streaming."""
 
-File: src/nexus_orchestrator/observability/__init__.py
-Last updated: 2026-02-11
+from nexus_orchestrator.observability.events import (
+    DispatchError,
+    EventBus,
+    PersistenceCallback,
+    Subscriber,
+)
+from nexus_orchestrator.observability.logging import (
+    LoggingConfig,
+    LogRedactor,
+    StructuredLoggingHandle,
+    correlation_scope,
+    default_log_redactor,
+    flush_logging,
+    get_active_logger,
+    get_active_logging_handle,
+    get_correlation_context,
+    reset_correlation_fields,
+    set_correlation_fields,
+    setup_logging,
+    setup_structured_logging,
+    shutdown_logging,
+)
+from nexus_orchestrator.observability.metrics import MetricsRegistry
 
-Purpose
-- Observability primitives: structured logging, metrics, tracing, and event stream.
-
-What should be included in this file
-- Logger setup, event bus, metrics registry interfaces.
-
-Functional requirements
-- Must support a local TUI/dashboard reading live run status.
-
-Non-functional requirements
-- Must redact secrets consistently.
-"""
+__all__ = [
+    "DispatchError",
+    "EventBus",
+    "LogRedactor",
+    "LoggingConfig",
+    "MetricsRegistry",
+    "PersistenceCallback",
+    "StructuredLoggingHandle",
+    "Subscriber",
+    "correlation_scope",
+    "default_log_redactor",
+    "flush_logging",
+    "get_active_logger",
+    "get_active_logging_handle",
+    "get_correlation_context",
+    "reset_correlation_fields",
+    "set_correlation_fields",
+    "setup_logging",
+    "setup_structured_logging",
+    "shutdown_logging",
+]

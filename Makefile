@@ -1,7 +1,7 @@
 # Makefile — convenience commands for local development (optional)
 #
 # File: Makefile
-# Last updated: 2026-02-11
+# Last updated: 2026-02-12
 #
 # Purpose
 # - Provide ergonomic shortcuts for the operator (you) and for agentic AIs running common tasks.
@@ -17,40 +17,48 @@
 # Makefile — common dev tasks
 # Run `make help` to see available targets.
 
-.PHONY: help install lint typecheck test test-unit test-integration test-smoke run plan status clean
+PYTHON ?= python
+
+.PHONY: help install lint typecheck test test-unit test-integration test-smoke security-scan audit run plan status clean
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "\033[36m%-20s\033[0m %s\n", $$1, $$2}'
 
 install: ## Install dependencies (dev)
-	pip install -e ".[dev,providers]" --break-system-packages
+	$(PYTHON) -m pip install -e ".[dev]"
 
 lint: ## Run linter and formatter checks
-	ruff check src/ tests/
-	ruff format --check src/ tests/
+	$(PYTHON) -m ruff check src/ tests/
+	$(PYTHON) -m ruff format --check src/ tests/
 
 typecheck: ## Run type checker
-	mypy src/nexus_orchestrator/
+	$(PYTHON) -m mypy src/nexus_orchestrator/
 
-test: test-unit test-integration ## Run all tests
+test: ## Run all tests (meta + unit + integration + smoke)
+	$(PYTHON) -m pytest tests/meta tests/unit tests/integration tests/smoke -v
 
 test-unit: ## Run unit tests
-	pytest tests/unit/ -v
+	$(PYTHON) -m pytest tests/unit/ -v
 
 test-integration: ## Run integration tests
-	pytest tests/integration/ -v
+	$(PYTHON) -m pytest tests/integration/ -v
 
 test-smoke: ## Run smoke tests (end-to-end with mocks)
-	pytest tests/smoke/ -v
+	$(PYTHON) -m pytest tests/smoke/ -v
+
+security-scan: ## Vulnerability scan of the current environment (best effort offline if cache exists)
+	$(PYTHON) -m pip_audit --progress-spinner off
+
+audit: lint typecheck test security-scan ## Run CI-style quality and security gates
 
 plan: ## Run planning on sample spec
-	python -m nexus_orchestrator plan samples/specs/minimal_design_doc.md
+	$(PYTHON) -m nexus_orchestrator plan samples/specs/minimal_design_doc.md
 
 run: ## Run orchestration with mock providers
-	python -m nexus_orchestrator run --mock
+	$(PYTHON) -m nexus_orchestrator run --mock
 
 status: ## Show current run status
-	python -m nexus_orchestrator status
+	$(PYTHON) -m nexus_orchestrator status
 
 clean: ## Remove ephemeral state, evidence, and workspaces
 	rm -rf state/ workspaces/ evidence/ artifacts/

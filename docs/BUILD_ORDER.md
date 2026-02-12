@@ -1,8 +1,8 @@
 <!--
-nexus-orchestrator — documentation skeleton
+nexus-orchestrator — implementation sequencing guide
 
 File: docs/BUILD_ORDER.md
-Last updated: 2026-02-11
+Last updated: 2026-02-12
 
 Purpose
 - A prescriptive file-by-file implementation order for an agentic AI to build the orchestrator incrementally.
@@ -31,6 +31,32 @@ Suggested sections / outline
 # Build Order — Incremental Implementation Guide for Agentic AI
 
 This document defines the exact order in which to implement the orchestrator, phase by phase, file by file. Each phase produces a working vertical slice that can be tested before moving on. Dependencies flow downward — never implement a file before its dependencies are complete.
+
+---
+
+## Phase 0 — Repo Blueprint & Tooling Gates
+
+**Goal:** Lock the repository-level quality contracts for Prompt 1 before feature implementation phases begin.
+
+**Dependencies:** None.
+
+**Build order:**
+
+1. `pyproject.toml` — development dependency bounds and tool configuration contracts
+2. `Makefile` — local gate command surface aligned with CI
+3. `.github/workflows/ci.yml` — CI contract (Python 3.11 + lint/type/test gates)
+4. `.github/workflows/security.yml` — security contract (secret scan + pip-audit schedule)
+5. `docs/quality/STYLE_AND_LINT.md` — normative style/type gate mapping
+6. `constraints/registry/000_base_constraints.yaml` — base constraints registry IDs and checker bindings
+7. `tools/registry.toml` — pinned tool catalog for deterministic provisioning
+8. `scripts/repo_audit.py` — deterministic audit entrypoint for repository blueprint JSON
+9. `src/nexus_orchestrator/repo_blueprint.py` — repository contract extraction engine
+10. `docs/REPO_BLUEPRINT.md` — generated repository contract report artifact
+11. `docs/BUILD_ORDER.md` — phase ownership and ordering contract
+12. `docs/FILE_MAP.md` — phase ownership and repository map contract
+13. `tests/meta/__init__.py` — package-level ownership anchor for meta contract tests
+
+**Acceptance test:** `pytest tests/meta -q` passes with Prompt 1 contract checks active.
 
 ---
 

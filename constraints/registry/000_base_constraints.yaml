@@ -1,7 +1,7 @@
 # 000_base_constraints.yaml — seed constraint set (baseline)
 #
 # File: constraints/registry/000_base_constraints.yaml
-# Last updated: 2026-02-11
+# Last updated: 2026-02-12
 #
 # Purpose
 # - Defines the initial always-on constraints for the orchestrator *itself* and for orchestrated projects.
@@ -96,14 +96,25 @@
   requirement_links: []
   source: manual
 
+- id: CON-STY-0003
+  severity: must
+  category: style
+  description: "Code passes strict static type checking (`mypy --strict`)"
+  checker: typecheck_checker
+  parameters:
+    mode: strict
+    target: "src/nexus_orchestrator/"
+  requirement_links: []
+  source: manual
+
 - id: CON-SEC-0002
   severity: must
   category: security
-  description: "No dependencies with known critical vulnerabilities"
+  description: "No dependencies with known high or critical vulnerabilities"
   checker: security_checker
   parameters:
     scan_type: dependency_audit
-    severity_threshold: critical
+    severity_threshold: high
   requirement_links: []
   source: manual
 

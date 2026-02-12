@@ -1,18 +1,32 @@
-"""
-nexus-orchestrator — module skeleton
+"""Utility exports for filesystem, hashing, and concurrency helpers."""
 
-File: src/nexus_orchestrator/utils/__init__.py
-Last updated: 2026-02-11
+from nexus_orchestrator.utils.concurrency import (
+    BoundedSemaphore,
+    CancellationToken,
+    WorkerPool,
+    run_with_timeout,
+)
+from nexus_orchestrator.utils.fs import atomic_write, is_within, safe_delete, temp_directory
+from nexus_orchestrator.utils.hashing import (
+    create_manifest,
+    sha256_bytes,
+    sha256_file,
+    sha256_text,
+    verify_manifest,
+)
 
-Purpose
-- Shared utilities (filesystem helpers, hashing, concurrency primitives) used across the codebase.
-
-What should be included in this file
-- Keep utils small and well-tested; avoid dumping ground.
-
-Functional requirements
-- Must not introduce cyclic dependencies.
-
-Non-functional requirements
-- Prefer standard library where possible.
-"""
+__all__ = [
+    "BoundedSemaphore",
+    "CancellationToken",
+    "WorkerPool",
+    "atomic_write",
+    "create_manifest",
+    "is_within",
+    "run_with_timeout",
+    "safe_delete",
+    "sha256_bytes",
+    "sha256_file",
+    "sha256_text",
+    "temp_directory",
+    "verify_manifest",
+]

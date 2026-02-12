@@ -1,7 +1,7 @@
 # tools/registry.toml — tool allowlist and version pinning
 #
 # File: tools/registry.toml
-# Last updated: 2026-02-11
+# Last updated: 2026-02-12
 #
 # Purpose
 # - Curated list of approved tools and pinned versions for deterministic installs inside sandboxes.
@@ -18,20 +18,32 @@
 # Tool allowlist — pinned versions for reproducibility
 # Add entries as agents request new tools.
 
-# [tool.ruff]
-# version = "0.4.0"
-# source = "pypi"
-# checksum = ""
-# risk = "low"
+[tool.ruff]
+version = "0.14.14"
+source = "pypi"
+risk = "low"
 
-# [tool.mypy]
-# version = "1.8.0"
-# source = "pypi"
-# checksum = ""
-# risk = "low"
+[tool.mypy]
+version = "1.19.1"
+source = "pypi"
+risk = "low"
 
-# [tool.pytest]
-# version = "8.0.0"
-# source = "pypi"
-# checksum = ""
-# risk = "low"
+[tool.pytest]
+version = "9.0.2"
+source = "pypi"
+risk = "low"
+
+[tool.hypothesis]
+version = "6.151.6"
+source = "pypi"
+risk = "low"
+
+[tool.pip-audit]
+version = "2.10.0"
+source = "pypi"
+risk = "medium"
+
+[tool.gitleaks]
+version = "8.24.2"
+source = "github-release"
+risk = "medium"

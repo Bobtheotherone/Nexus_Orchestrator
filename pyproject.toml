@@ -1,7 +1,7 @@
 # pyproject.toml — Python project metadata & tool config (private-first)
 #
 # File: pyproject.toml
-# Last updated: 2026-02-11
+# Last updated: 2026-02-12
 #
 # Purpose
 # - Define the orchestrator as a local, developer-run tool.
@@ -30,28 +30,31 @@ readme = "README.md"
 license = {text = "MIT"}
 
 dependencies = [
-    # Core (keep minimal)
-    # "tomli>=2.0;python_version<'3.11'",  # stdlib in 3.11+
-    # "pydantic>=2.0",           # data validation and serialization
-    # "aiosqlite>=0.19",         # async SQLite for state DB
-    # "gitpython>=3.1",          # Git operations
-    # "jinja2>=3.1",             # prompt template rendering
-    # "structlog>=23.0",         # structured logging
-    # "rich>=13.0",              # CLI output formatting
-    # "ulid-py>=1.1",            # ULID generation for IDs
+    # Core runtime (minimal, deterministic)
+    "pydantic>=2.9,<3",
+    "pydantic-settings>=2.6,<3",
+    "PyYAML>=6.0.2,<7",
+    "aiosqlite>=0.20,<1",
+    "GitPython>=3.1.43,<4",
+    "Jinja2>=3.1.4,<4",
+    "structlog>=24.4,<25",
+    "ulid-py>=1.1,<2",
 ]
 
 [project.optional-dependencies]
 providers = [
-    # "openai>=1.0",             # OpenAI/Codex adapter
-    # "anthropic>=0.30",         # Anthropic/Claude adapter
+    "openai>=1.58,<2",            # OpenAI/Codex adapter
+    "anthropic>=0.42,<1",         # Anthropic/Claude adapter
 ]
 dev = [
-    "hypothesis>=6.136.0,<7",
-    "mypy>=1.19.1,<2",
-    "pytest>=9.0.2,<10",
-    "pytest-asyncio>=1.2.0,<2",
-    "ruff>=0.14.13,<0.15",
+    "ruff==0.14.14",
+    "mypy==1.19.1",
+    "pytest==9.0.2",
+    "hypothesis==6.151.6",
+    "pytest-cov==6.3.0",
+    "pytest-asyncio==1.3.0",
+    "PyYAML==6.0.3",
+    "pip-audit==2.10.0",
 ]
 tui = [
     # "textual>=0.50",           # TUI framework
@@ -63,6 +66,7 @@ nexus = "nexus_orchestrator.main:cli_entrypoint"
 [tool.ruff]
 line-length = 100
 target-version = "py311"
+src = ["src", "tests"]
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "N", "UP", "B", "A", "SIM", "TCH"]
@@ -77,10 +81,21 @@ python_version = "3.11"
 strict = true
 warn_return_any = true
 warn_unused_configs = true
+mypy_path = "src"
 
 [tool.pytest.ini_options]
+minversion = "8.0"
 testpaths = ["tests"]
 asyncio_mode = "auto"
+addopts = ["-ra", "--strict-config", "--strict-markers"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+markers = [
+    "unit: fast unit tests",
+    "integration: tests that require multiple components",
+    "smoke: end-to-end smoke tests",
+]
 
 [build-system]
 requires = ["setuptools>=69", "wheel"]
@@ -91,4 +106,3 @@ package-dir = {"" = "src"}
 
 [tool.setuptools.packages.find]
 where = ["src"]
-

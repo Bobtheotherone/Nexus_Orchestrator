@@ -1,8 +1,8 @@
 <!--
-nexus-orchestrator — documentation skeleton
+nexus-orchestrator — repository map index
 
 File: docs/FILE_MAP.md
-Last updated: 2026-02-11
+Last updated: 2026-02-12
 
 Purpose
 - A map of the repo layout: which directory corresponds to which plane/component in the design doc, and where key schemas live.
@@ -36,6 +36,7 @@ This document maps every directory and key file to its purpose, the design docum
 | Directory | Purpose | Design Doc Section |
 |---|---|---|
 | `src/nexus_orchestrator/` | All Python source code, organized by architectural plane | §5 System Architecture |
+| `.github/workflows/` | CI and security policy gates for repository enforcement | §10 Quality Assurance |
 | `tests/` | Unit, integration, and smoke tests mirroring src structure | §10 Quality Assurance |
 | `docs/` | Architecture specs, schemas, runbooks, prompt templates, ADRs | §13 Observability |
 | `constraints/` | Constraint registry YAML files and reusable constraint libraries | §6 Constraint-Based Program Synthesis |
@@ -47,6 +48,28 @@ This document maps every directory and key file to its purpose, the design docum
 | `samples/` | Sample design docs and test fixtures for smoke testing | §14 Project Lifecycle |
 | `profiles/` | Operator personalization profile(s) (preferences/house rules) | §5 Knowledge Plane |
 | `scripts/` | Development utilities, migration helpers, diagnostics | — |
+
+---
+
+## Phase 0 Ownership — Repo Blueprint & Tooling Gates
+
+Prompt 1 reserves the following files as the Phase 0 contract surface for repository tooling gates, docs ownership, and meta verification:
+
+| Path | Contract Role |
+|---|---|
+| `pyproject.toml` | Dependency/version gate and local tool configuration source |
+| `Makefile` | Local quality/security gate command surface |
+| `.github/workflows/ci.yml` | CI quality gate definition |
+| `.github/workflows/security.yml` | Security gate definition |
+| `docs/quality/STYLE_AND_LINT.md` | Normative style/type standards and constraint mapping |
+| `scripts/repo_audit.py` | Deterministic repo audit CLI for blueprint JSON |
+| `src/nexus_orchestrator/repo_blueprint.py` | Deterministic blueprint extractor and validator |
+| `docs/REPO_BLUEPRINT.md` | Generated human-readable blueprint artifact |
+| `constraints/registry/000_base_constraints.yaml` | Base registry invariants and style/security constraint IDs |
+| `tools/registry.toml` | Pinned tool versions and risk metadata |
+| `docs/BUILD_ORDER.md` | Phase ownership and sequencing authority |
+| `docs/FILE_MAP.md` | Repository ownership and path mapping authority |
+| `tests/meta/__init__.py` | Phase 0 ownership anchor for meta contract tests |
 
 ---
 

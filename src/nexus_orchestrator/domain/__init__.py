@@ -1,19 +1,125 @@
-"""
-nexus-orchestrator — module skeleton
+"""Domain-layer public exports for IDs, models, and events."""
 
-File: src/nexus_orchestrator/domain/__init__.py
-Last updated: 2026-02-11
+from nexus_orchestrator.domain.events import EventType, NexusEvent, redact_sensitive
+from nexus_orchestrator.domain.ids import (
+    ARTIFACT_ID_PREFIX,
+    ATTEMPT_ID_PREFIX,
+    CONSTRAINT_ID_PATTERN_DESCRIPTION,
+    EVENT_ID_PREFIX,
+    EVIDENCE_ID_PREFIX,
+    INCIDENT_ID_PREFIX,
+    MERGE_ID_PREFIX,
+    REQ_ID_PATTERN_DESCRIPTION,
+    RUN_ID_PREFIX,
+    ULID_LENGTH,
+    ULID_MAX_TIMESTAMP_MS,
+    WORK_ITEM_ID_PREFIX,
+    generate_artifact_id,
+    generate_attempt_id,
+    generate_event_id,
+    generate_evidence_id,
+    generate_incident_id,
+    generate_merge_id,
+    generate_prefixed_id,
+    generate_run_id,
+    generate_ulid,
+    generate_work_item_id,
+    parse_ulid_timestamp_ms,
+    short_id,
+    validate_artifact_id,
+    validate_attempt_id,
+    validate_constraint_id,
+    validate_event_id,
+    validate_evidence_id,
+    validate_incident_id,
+    validate_merge_id,
+    validate_prefixed_id,
+    validate_requirement_id,
+    validate_run_id,
+    validate_ulid,
+    validate_work_item_id,
+)
+from nexus_orchestrator.domain.models import (
+    Artifact,
+    Attempt,
+    AttemptResult,
+    Budget,
+    Constraint,
+    ConstraintEnvelope,
+    ConstraintSeverity,
+    ConstraintSource,
+    EvidenceRecord,
+    EvidenceResult,
+    Incident,
+    MergeRecord,
+    Requirement,
+    RiskTier,
+    Run,
+    SandboxPolicy,
+    SpecMap,
+    TaskGraph,
+    WorkItem,
+    WorkItemStatus,
+)
 
-Purpose
-- Domain types shared across planes: WorkItem, Constraint, Evidence, Run, Artifact, ToolRequest, etc.
-
-What should be included in this file
-- Re-export of core domain entities for convenience.
-- Keep domain layer free of IO side effects.
-
-Functional requirements
-- Domain objects must be serializable and versioned.
-
-Non-functional requirements
-- Domain layer should have minimal dependencies.
-"""
+__all__ = [
+    "ATTEMPT_ID_PREFIX",
+    "ARTIFACT_ID_PREFIX",
+    "Artifact",
+    "Attempt",
+    "AttemptResult",
+    "Budget",
+    "CONSTRAINT_ID_PATTERN_DESCRIPTION",
+    "Constraint",
+    "ConstraintEnvelope",
+    "ConstraintSeverity",
+    "ConstraintSource",
+    "EVIDENCE_ID_PREFIX",
+    "EVENT_ID_PREFIX",
+    "EventType",
+    "EvidenceRecord",
+    "EvidenceResult",
+    "INCIDENT_ID_PREFIX",
+    "Incident",
+    "MERGE_ID_PREFIX",
+    "MergeRecord",
+    "NexusEvent",
+    "REQ_ID_PATTERN_DESCRIPTION",
+    "RUN_ID_PREFIX",
+    "Requirement",
+    "RiskTier",
+    "Run",
+    "SandboxPolicy",
+    "SpecMap",
+    "TaskGraph",
+    "ULID_LENGTH",
+    "ULID_MAX_TIMESTAMP_MS",
+    "WORK_ITEM_ID_PREFIX",
+    "WorkItem",
+    "WorkItemStatus",
+    "generate_attempt_id",
+    "generate_artifact_id",
+    "generate_evidence_id",
+    "generate_event_id",
+    "generate_incident_id",
+    "generate_merge_id",
+    "generate_prefixed_id",
+    "generate_run_id",
+    "generate_ulid",
+    "generate_work_item_id",
+    "parse_ulid_timestamp_ms",
+    "redact_sensitive",
+    "short_id",
+    "validate_attempt_id",
+    "validate_artifact_id",
+    "validate_constraint_id",
+    "validate_evidence_id",
+    "validate_event_id",
+    "validate_incident_id",
+    "validate_merge_id",
+    "validate_prefixed_id",
+    "validate_requirement_id",
+    "validate_run_id",
+    "validate_ulid",
+    "validate_work_item_id",
+]

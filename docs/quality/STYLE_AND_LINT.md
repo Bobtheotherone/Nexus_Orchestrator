@@ -1,8 +1,8 @@
 <!--
-nexus-orchestrator — documentation skeleton
+nexus-orchestrator — style and lint policy
 
 File: docs/quality/STYLE_AND_LINT.md
-Last updated: 2026-02-11
+Last updated: 2026-02-12
 
 Purpose
 - Defines formatting/linting/typecheck standards for the orchestrator repo itself.
@@ -27,13 +27,22 @@ Suggested sections / outline
 
 # Style and Lint Standards
 
-## Tools (once installed)
+## Tools
 
-| Tool | Purpose | Config |
-|---|---|---|
-| `ruff` | Linter + formatter (replaces flake8, isort, black) | `pyproject.toml [tool.ruff]` |
-| `mypy` | Static type checker (strict mode) | `pyproject.toml [tool.mypy]` |
-| `pytest` | Test runner | `pyproject.toml [tool.pytest]` |
+| Tool | Version policy | Purpose | Config |
+|---|---|---|---|
+| `ruff` | `0.14.14` (`pyproject.toml` + `tools/registry.toml`) | Linter + formatter (replaces flake8, isort, black) | `pyproject.toml [tool.ruff]` |
+| `mypy` | `1.19.1` (`pyproject.toml` + `tools/registry.toml`) | Static type checker (strict mode) | `pyproject.toml [tool.mypy]` |
+| `pytest` | `9.0.2` (`pyproject.toml` + `tools/registry.toml`) | Test runner | `pyproject.toml [tool.pytest]` |
+| `hypothesis` | `6.151.6` (`pyproject.toml` + `tools/registry.toml`) | Property-based contract tests | `tests/meta/` |
+
+## Enforced Commands
+
+Local and CI must run the same baseline gates:
+- `ruff check src/ tests/`
+- `ruff format --check src/ tests/`
+- `mypy src/nexus_orchestrator/`
+- `pytest tests/meta tests/unit tests/integration tests/smoke -v`
 
 ## Rules to Minimize Merge Conflicts
 
