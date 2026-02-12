@@ -419,6 +419,16 @@ def test_meta_3_security_workflow_contract() -> None:
         "pip-audit" in uses.lower() for uses in uses_entries
     )
     assert pip_audit_present, "Security workflow must include a pip-audit step."
+    strict_pip_audit_commands = [
+        command
+        for command in commands
+        if _invokes_tool(command, "pip_audit") and "--strict" in command
+    ]
+    assert strict_pip_audit_commands, "Security workflow pip_audit command must include --strict."
+    for command in strict_pip_audit_commands:
+        assert "--skip-editable" in command, (
+            "Security workflow pip_audit commands using --strict must also use --skip-editable."
+        )
     secret_scan_tokens = ("gitleaks", "trufflehog", "detect-secrets", "secretlint", "ggshield")
     secret_scan_present = any(
         any(token in command.lower() for token in secret_scan_tokens) for command in commands

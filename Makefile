@@ -47,7 +47,7 @@ test-smoke: ## Run smoke tests (end-to-end with mocks)
 	$(PYTHON) -m pytest tests/smoke/ -v
 
 security-scan: ## Vulnerability scan of the current environment (best effort offline if cache exists)
-	$(PYTHON) -m pip_audit --progress-spinner off
+	$(PYTHON) -m pip_audit --skip-editable --progress-spinner off
 
 audit: lint typecheck test security-scan ## Run CI-style quality and security gates
 
