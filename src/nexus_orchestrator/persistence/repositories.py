@@ -43,7 +43,7 @@ from nexus_orchestrator.domain.models import (
     WorkItemStatus,
 )
 from nexus_orchestrator.persistence.state_db import RowValue, SQLParams, StateDB, canonical_json
-from nexus_orchestrator.security.redaction import redact_structure
+from nexus_orchestrator.security.redaction import redact_structure, scan_for_secrets
 from nexus_orchestrator.utils.hashing import sha256_text
 
 if TYPE_CHECKING:
@@ -1460,35 +1460,51 @@ def _append_evidence_to_work_item(
 
 
 def _sanitize_run(run: Run) -> Run:
-    return Run.from_dict(_redacted_mapping(run.to_dict(), "Run"))
+    payload = run.to_dict()
+    _assert_no_secret_values(payload, "Run")
+    return Run.from_dict(payload)
 
 
 def _sanitize_work_item(work_item: WorkItem) -> WorkItem:
-    return WorkItem.from_dict(_redacted_mapping(work_item.to_dict(), "WorkItem"))
+    payload = work_item.to_dict()
+    _assert_no_secret_values(payload, "WorkItem")
+    return WorkItem.from_dict(payload)
 
 
 def _sanitize_constraint(constraint: Constraint) -> Constraint:
-    return Constraint.from_dict(_redacted_mapping(constraint.to_dict(), "Constraint"))
+    payload = constraint.to_dict()
+    _assert_no_secret_values(payload, "Constraint")
+    return Constraint.from_dict(payload)
 
 
 def _sanitize_evidence(record: EvidenceRecord) -> EvidenceRecord:
-    return EvidenceRecord.from_dict(_redacted_mapping(record.to_dict(), "EvidenceRecord"))
+    payload = record.to_dict()
+    _assert_no_secret_values(payload, "EvidenceRecord")
+    return EvidenceRecord.from_dict(payload)
 
 
 def _sanitize_attempt(attempt: Attempt) -> Attempt:
-    return Attempt.from_dict(_redacted_mapping(attempt.to_dict(), "Attempt"))
+    payload = attempt.to_dict()
+    _assert_no_secret_values(payload, "Attempt")
+    return Attempt.from_dict(payload)
 
 
 def _sanitize_merge(merge: MergeRecord) -> MergeRecord:
-    return MergeRecord.from_dict(_redacted_mapping(merge.to_dict(), "MergeRecord"))
+    payload = merge.to_dict()
+    _assert_no_secret_values(payload, "MergeRecord")
+    return MergeRecord.from_dict(payload)
 
 
 def _sanitize_incident(incident: Incident) -> Incident:
-    return Incident.from_dict(_redacted_mapping(incident.to_dict(), "Incident"))
+    payload = incident.to_dict()
+    _assert_no_secret_values(payload, "Incident")
+    return Incident.from_dict(payload)
 
 
 def _sanitize_task_graph(graph: TaskGraph) -> TaskGraph:
-    return TaskGraph.from_dict(_redacted_mapping(graph.to_dict(), "TaskGraph"))
+    payload = graph.to_dict()
+    _assert_no_secret_values(payload, "TaskGraph")
+    return TaskGraph.from_dict(payload)
 
 
 def _sanitize_provider_call(record: ProviderCallRecord) -> ProviderCallRecord:
@@ -1510,6 +1526,32 @@ def _redacted_mapping(payload: Mapping[str, object], path: str) -> dict[str, obj
             raise ValueError(f"{path}: non-string key after redaction")
         out[key] = cast("object", value)
     return out
+
+
+def _assert_no_secret_values(value: object, path: str) -> None:
+    if value is None or isinstance(value, (bool, int, float)):
+        return
+
+    if isinstance(value, str):
+        findings = scan_for_secrets(value)
+        if findings:
+            rules = ", ".join(sorted({finding.rule for finding in findings}))
+            raise ValueError(
+                f"{path}: contains secret-like value ({rules}); "
+                "use env var references, not raw secrets"
+            )
+        return
+
+    if isinstance(value, Mapping):
+        for key, item in value.items():
+            key_part = key if isinstance(key, str) else str(key)
+            _assert_no_secret_values(item, f"{path}.{key_part}")
+        return
+
+    if isinstance(value, (list, tuple)):
+        for index, item in enumerate(value):
+            _assert_no_secret_values(item, f"{path}[{index}]")
+        return
 
 
 def _row_text(row: Mapping[str, RowValue], key: str, path: str) -> str:

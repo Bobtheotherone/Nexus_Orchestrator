@@ -13,6 +13,7 @@ from nexus_orchestrator.domain import ids
 from nexus_orchestrator.domain.models import RunStatus, WorkItem, WorkItemStatus
 from nexus_orchestrator.persistence.repositories import (
     AttemptRepo,
+    ConstraintRepo,
     EvidenceRepo,
     ProviderCallRecord,
     ProviderCallRepo,
@@ -23,7 +24,6 @@ from nexus_orchestrator.persistence.repositories import (
     WorkItemRepo,
 )
 from nexus_orchestrator.persistence.state_db import StateDB
-from nexus_orchestrator.security.redaction import REDACTED_VALUE, scan_for_secrets
 
 from . import (
     collect_text_cells,
@@ -135,6 +135,29 @@ def test_fk_and_status_invariants_are_enforced(tmp_path: Path) -> None:
         )
 
 
+def test_constraint_parameters_with_secrets_are_rejected(tmp_path: Path) -> None:
+    db = StateDB(tmp_path / "state" / "nexus.sqlite3")
+    db.migrate()
+
+    constraint_repo = ConstraintRepo(db)
+    secret_openai = "sk-FAKEOPENAIKEY12345678901234567890"
+
+    safe_constraint = make_work_item(25_000).constraint_envelope.constraints[0]
+    assert constraint_repo.add(safe_constraint) == safe_constraint
+
+    secret_constraint = make_work_item(
+        25_001,
+        constraint_parameters={"provider_secret": secret_openai},
+    ).constraint_envelope.constraints[0]
+
+    with pytest.raises(ValueError, match=r"Constraint\.parameters\.provider_secret"):
+        constraint_repo.add(secret_constraint)
+
+    with db.connection() as conn:
+        all_text = collect_text_cells(conn)
+    assert secret_openai not in all_text
+
+
 def test_get_next_runnable_respects_dependency_and_status_gates(tmp_path: Path) -> None:
     db = StateDB(tmp_path / "state" / "nexus.sqlite3")
     db.migrate()
@@ -224,7 +247,7 @@ def test_provider_call_and_tool_install_roundtrip(tmp_path: Path) -> None:
     assert tool_repo.get(tool_install.id) == tool_install
 
 
-def test_redaction_prevents_secret_persistence(tmp_path: Path) -> None:
+def test_semantic_secret_values_are_rejected_without_mutation(tmp_path: Path) -> None:
     db = StateDB(tmp_path / "state" / "nexus.sqlite3")
     db.migrate()
 
@@ -235,33 +258,42 @@ def test_redaction_prevents_secret_persistence(tmp_path: Path) -> None:
     secret_openai = "sk-FAKEOPENAIKEY12345678901234567890"
     secret_github = "ghp_abcdefghijklmnopqrstuvwxyz0123456789"
 
-    run = make_run(
-        50_000,
-        metadata={
-            "operator": "local",
-            "api_key": secret_openai,
-            "nested": {"token": secret_github},
-        },
-    )
-    work_item = make_work_item(50_001)
-    evidence = make_evidence(
-        50_002,
-        run_id=run.id,
-        work_item_id=work_item.id,
-        metadata={"authorization": f"Bearer {secret_openai}"},
-    )
+    safe_run = make_run(50_000)
+    safe_work_item = make_work_item(50_001)
+    run_repo.add(safe_run)
+    work_item_repo.add(safe_run.id, safe_work_item)
 
-    run_repo.add(run)
-    work_item_repo.add(run.id, work_item)
-    evidence_repo.add(evidence)
+    run_with_secret = make_run(
+        50_010,
+        metadata={"operator": "local", "api_key": secret_openai},
+    )
+    with pytest.raises(ValueError, match=r"Run\.metadata\.api_key"):
+        run_repo.add(run_with_secret)
+
+    work_item_with_secret = make_work_item(
+        50_011,
+        constraint_parameters={"provider_token": secret_github},
+    )
+    with pytest.raises(
+        ValueError,
+        match=r"WorkItem\.constraint_envelope\.constraints\[0\]\.parameters\.provider_token",
+    ):
+        work_item_repo.add(safe_run.id, work_item_with_secret)
+
+    evidence_with_secret = make_evidence(
+        50_002,
+        run_id=safe_run.id,
+        work_item_id=safe_work_item.id,
+        metadata={"prompt_blob": secret_openai},
+    )
+    with pytest.raises(ValueError, match=r"EvidenceRecord\.metadata\.prompt_blob"):
+        evidence_repo.add(evidence_with_secret)
 
     with db.connection() as conn:
         all_text = collect_text_cells(conn)
 
     assert secret_openai not in all_text
     assert secret_github not in all_text
-    assert REDACTED_VALUE in all_text
-    assert scan_for_secrets(all_text) == ()
 
 
 if _HYPOTHESIS_AVAILABLE:
