@@ -18,3 +18,49 @@ Functional requirements
 Non-functional requirements
 - SQLite-first; avoid heavy DB dependencies.
 """
+
+from nexus_orchestrator.persistence.repositories import (
+    AttemptRepo,
+    ConstraintRepo,
+    EvidenceRepo,
+    IncidentRepo,
+    MergeRepo,
+    ProviderCallRecord,
+    ProviderCallRepo,
+    RunRepo,
+    TaskGraphRepo,
+    ToolInstallRecord,
+    ToolInstallRepo,
+    ToolRepo,
+    WorkItemRepo,
+)
+from nexus_orchestrator.persistence.state_db import (
+    MigrationRecord,
+    StateDB,
+    StateDBBusyError,
+    StateDBCorruptionError,
+    StateDBError,
+    StateDBMigrationError,
+)
+
+__all__ = [
+    "AttemptRepo",
+    "ConstraintRepo",
+    "EvidenceRepo",
+    "IncidentRepo",
+    "MergeRepo",
+    "MigrationRecord",
+    "ProviderCallRecord",
+    "ProviderCallRepo",
+    "RunRepo",
+    "StateDB",
+    "StateDBBusyError",
+    "StateDBCorruptionError",
+    "StateDBError",
+    "StateDBMigrationError",
+    "TaskGraphRepo",
+    "ToolInstallRecord",
+    "ToolInstallRepo",
+    "ToolRepo",
+    "WorkItemRepo",
+]
