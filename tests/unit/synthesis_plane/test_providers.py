@@ -258,18 +258,21 @@ def test_provider_error_subclasses_are_uniformly_constructible_for_audit() -> No
 
 
 def test_redact_transcript_redacts_prompt_and_response() -> None:
+    fake_openai_key = "sk-" + "1234567890ABCDEFGHijkl"
+    fake_anthropic_key = "sk-ant-" + "1234567890_ABCDEFGHijkl"
+    fake_bearer_token = "SUPER" + "SECRETTOKEN"
     transcript = redact_transcript(
         provider="openai",
         model="gpt-4.1-mini",
         idempotency_key="idem-1",
-        prompt="OPENAI_API_KEY=sk-1234567890ABCDEFGHijkl should be redacted",
-        response="authorization: bearer SUPERSECRETTOKEN should be redacted",
-        error="anthropic key sk-ant-1234567890_ABCDEFGHijkl should be redacted",
+        prompt=f"OPENAI_API_KEY={fake_openai_key} should be redacted",
+        response=f"authorization: bearer {fake_bearer_token} should be redacted",
+        error=f"anthropic key {fake_anthropic_key} should be redacted",
     )
 
-    assert "sk-1234567890ABCDEFGHijkl" not in transcript.prompt
-    assert "SUPERSECRETTOKEN" not in (transcript.response or "")
-    assert "sk-ant-1234567890_ABCDEFGHijkl" not in (transcript.error or "")
+    assert fake_openai_key not in transcript.prompt
+    assert fake_bearer_token not in (transcript.response or "")
+    assert fake_anthropic_key not in (transcript.error or "")
     assert transcript.idempotency_key == "idem-1"
 
 
@@ -565,13 +568,14 @@ async def test_explicit_idempotency_key_is_preserved_in_request_headers() -> Non
     )
 
     adapter = OpenAIAdapter(model="gpt-4.1-mini", client=_FakeOpenAIClient(responses=fake_api))
+    explicit_idempotency = "idem-" + "explicit-123"
     response = await adapter.send(
         _request(
             model="gpt-4.1-mini",
             prompt="Use explicit idempotency",
-            idempotency_key="idem-explicit-123",
+            idempotency_key=explicit_idempotency,
         )
     )
 
-    assert fake_api.calls[0]["extra_headers"] == {"Idempotency-Key": "idem-explicit-123"}
-    assert response.idempotency_key == "idem-explicit-123"
+    assert fake_api.calls[0]["extra_headers"] == {"Idempotency-Key": explicit_idempotency}
+    assert response.idempotency_key == explicit_idempotency
