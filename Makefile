@@ -19,7 +19,7 @@
 
 PYTHON ?= python
 
-.PHONY: help install lint typecheck test test-unit test-integration test-smoke security-scan audit run plan status clean
+.PHONY: help install lint typecheck test test-unit test-integration test-smoke security-scan placeholder-gate secret-audit audit run plan status clean
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "\033[36m%-20s\033[0m %s\n", $$1, $$2}'
@@ -51,7 +51,13 @@ security-scan: ## Vulnerability scan of the current environment (best effort off
 	$(PYTHON) -m pip freeze --all --exclude-editable > .security-reports/frozen-requirements.txt
 	$(PYTHON) -m pip_audit --strict --no-deps --progress-spinner off --format json --output .security-reports/pip-audit.json -r .security-reports/frozen-requirements.txt
 
-audit: lint typecheck test security-scan ## Run CI-style quality and security gates
+placeholder-gate: ## Run canonical placeholder gate (WSL-safe)
+	$(PYTHON) scripts/placeholder_gate.py
+
+secret-audit: ## Scan for likely secret leaks outside tests/caches (WSL-safe)
+	bash scripts/secret_audit.sh
+
+audit: lint typecheck test placeholder-gate secret-audit security-scan ## Run CI-style quality and security gates
 
 plan: ## Run planning on sample spec
 	$(PYTHON) -m nexus_orchestrator plan samples/specs/minimal_design_doc.md

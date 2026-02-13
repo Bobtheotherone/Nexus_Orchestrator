@@ -25,6 +25,7 @@ from nexus_orchestrator.verification_plane.checkers.base import (
 from nexus_orchestrator.verification_plane.checkers.build_checker import (
     CommandChecker,
     checker_parameters,
+    extract_constraint_ids,
 )
 
 
@@ -42,8 +43,29 @@ class PerformanceChecker(CommandChecker):
     default_timeout_seconds = 300.0
 
     async def check(self, context: CheckerContext) -> CheckResult:
-        result = await super().check(context)
         params = checker_parameters(context, self.checker_id)
+        constraint_ids = extract_constraint_ids(context, params, self.covered_constraint_ids)
+        run_without_constraints = (
+            bool(params.get("run_without_constraints"))
+            if isinstance(params.get("run_without_constraints"), bool)
+            else False
+        )
+        if not constraint_ids and not run_without_constraints:
+            return CheckResult(
+                status=CheckStatus.SKIP,
+                violations=(),
+                covered_constraint_ids=(),
+                tool_versions={"performance_checker": "builtin-1"},
+                artifact_paths=(),
+                logs_path=None,
+                command_lines=(),
+                duration_ms=0,
+                metadata={"reason": "no_performance_constraints"},
+                checker_id=self.checker_id,
+                stage=self.stage,
+            )
+
+        result = await super().check(context)
         max_duration = params.get("max_duration_seconds")
 
         if result.status is not CheckStatus.PASS:

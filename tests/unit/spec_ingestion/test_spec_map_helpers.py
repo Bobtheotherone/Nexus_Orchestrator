@@ -369,7 +369,7 @@ def test_diff_is_empty_property_and_invalid_serializer_inputs() -> None:
     with pytest.raises(ValueError, match="Unsupported format"):
         deserialize_spec_map("{}", format="yaml")  # type: ignore[arg-type]
     with pytest.raises(ValueError, match="req_id must not be empty"):
-        trace_requirement_to_work_items("   ", [])  # type: ignore[arg-type]
+        trace_requirement_to_work_items("   ", [])
 
 
 def test_toml_value_helper_branches() -> None:

@@ -3,6 +3,7 @@
 from nexus_orchestrator.quality.placeholder_audit import (
     DEFAULT_EXCLUDE,
     DEFAULT_ROOTS,
+    DEFAULT_SEVERITY_BY_PATH,
     AstContext,
     AuditResult,
     ContextLine,
@@ -18,6 +19,7 @@ __all__ = [
     "ContextLine",
     "DEFAULT_EXCLUDE",
     "DEFAULT_ROOTS",
+    "DEFAULT_SEVERITY_BY_PATH",
     "Finding",
     "format_json",
     "format_text",

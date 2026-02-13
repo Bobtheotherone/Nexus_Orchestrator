@@ -235,6 +235,18 @@ class ConstraintEvidenceLink:
 
 
 @dataclass(frozen=True, slots=True)
+class GateViolation:
+    """Aggregated gate-level violation used for strict diagnostics."""
+
+    code: str
+    message: str
+    severity: str = "error"
+    constraint_id: str | None = None
+    stage: str | None = None
+    checker_id: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class ConstraintAssessment:
     """Deterministic constraint-level gate assessment."""
 
@@ -362,6 +374,8 @@ class ConstraintGateDecision:
     verdict: GateVerdict
     reason_codes: tuple[str, ...]
     diagnostics: ConstraintGateDiagnostics
+    evidence_records: tuple[ConstraintEvidenceLink, ...] = ()
+    aggregated_violations: tuple[GateViolation, ...] = ()
 
     @property
     def accepted(self) -> bool:
@@ -376,6 +390,20 @@ class ConstraintGateDecision:
         payload["verdict"] = self.verdict.value
         payload["accepted"] = self.accepted
         payload["reason_codes"] = list(self.reason_codes)
+        payload["evidence_records"] = [
+            {"stage": link.stage, "checker_id": link.checker_id} for link in self.evidence_records
+        ]
+        payload["aggregated_violations"] = [
+            {
+                "code": violation.code,
+                "message": violation.message,
+                "severity": violation.severity,
+                "constraint_id": violation.constraint_id,
+                "stage": violation.stage,
+                "checker_id": violation.checker_id,
+            }
+            for violation in self.aggregated_violations
+        ]
         return payload
 
 
@@ -543,11 +571,18 @@ def evaluate_constraint_gate(
         stage_assessments=stage_assessments,
         constraint_assessments=tuple(constraint_assessments),
     )
+    evidence_records = _collect_evidence_records(tuple(constraint_assessments))
+    aggregated_violations = _collect_gate_violations(
+        diagnostics=diagnostics,
+        constraint_assessments=tuple(constraint_assessments),
+    )
 
     return ConstraintGateDecision(
         verdict=verdict,
         reason_codes=reason_codes,
         diagnostics=diagnostics,
+        evidence_records=evidence_records,
+        aggregated_violations=aggregated_violations,
     )
 
 
@@ -727,6 +762,117 @@ def _build_reason_codes(
     if unresolved_should_constraints:
         reason_codes.append("should_constraint_requires_override")
     return tuple(reason_codes)
+
+
+def _collect_evidence_records(
+    assessments: Sequence[ConstraintAssessment],
+) -> tuple[ConstraintEvidenceLink, ...]:
+    unique_pairs = sorted(
+        {
+            (link.stage, link.checker_id)
+            for assessment in assessments
+            for link in assessment.pass_evidence
+        }
+    )
+    return tuple(
+        ConstraintEvidenceLink(stage=stage, checker_id=checker_id)
+        for stage, checker_id in unique_pairs
+    )
+
+
+def _collect_gate_violations(
+    *,
+    diagnostics: ConstraintGateDiagnostics,
+    constraint_assessments: Sequence[ConstraintAssessment],
+) -> tuple[GateViolation, ...]:
+    collected: list[GateViolation] = []
+
+    for stage_id in diagnostics.missing_required_stages:
+        collected.append(
+            GateViolation(
+                code="gate.required_stage_missing",
+                message=f"required stage missing: {stage_id}",
+                stage=stage_id,
+            )
+        )
+    for stage_id in diagnostics.failing_required_stages:
+        collected.append(
+            GateViolation(
+                code="gate.required_stage_failed",
+                message=f"required stage failed: {stage_id}",
+                stage=stage_id,
+            )
+        )
+    for gap in diagnostics.stage_coverage_gaps:
+        collected.append(
+            GateViolation(
+                code="gate.stage_coverage_incomplete",
+                message=(
+                    "stage passed without required coverage: "
+                    f"stage={gap.stage} constraint={gap.constraint_id}"
+                ),
+                stage=gap.stage,
+                constraint_id=gap.constraint_id,
+            )
+        )
+
+    for constraint_id in diagnostics.missing_checker_mappings:
+        collected.append(
+            GateViolation(
+                code="gate.missing_checker_mapping",
+                message=f"missing checker mapping evidence for {constraint_id}",
+                constraint_id=constraint_id,
+            )
+        )
+    for constraint_id in diagnostics.uncovered_must_constraints:
+        collected.append(
+            GateViolation(
+                code="gate.must_constraint_unsatisfied",
+                message=f"must constraint unsatisfied: {constraint_id}",
+                constraint_id=constraint_id,
+            )
+        )
+    for constraint_id in diagnostics.unresolved_should_constraints:
+        collected.append(
+            GateViolation(
+                code="gate.should_constraint_unsatisfied",
+                message=f"should constraint unsatisfied without override: {constraint_id}",
+                constraint_id=constraint_id,
+            )
+        )
+
+    assessment_by_id = {item.constraint_id: item for item in constraint_assessments}
+    for constraint_id in diagnostics.overridden_should_constraints:
+        assessment = assessment_by_id.get(constraint_id)
+        checker_id = assessment.checker_binding if assessment is not None else None
+        collected.append(
+            GateViolation(
+                code="gate.should_constraint_overridden",
+                message=f"should constraint overridden by approved record: {constraint_id}",
+                severity="warning",
+                constraint_id=constraint_id,
+                checker_id=checker_id,
+            )
+        )
+
+    deduped: dict[tuple[str, str, str, str, str, str], GateViolation] = {}
+    for item in collected:
+        key = (
+            item.code,
+            item.message,
+            item.severity,
+            item.constraint_id or "",
+            item.stage or "",
+            item.checker_id or "",
+        )
+        deduped[key] = item
+    return tuple(
+        deduped[key]
+        for key in sorted(
+            deduped,
+            key=lambda item: (item[2], item[0], item[3], item[4], item[5], item[1]),
+        )
+    )
 
 
 def _resolve_required_stages(output: PipelineOutput) -> tuple[str, ...]:
@@ -985,6 +1131,7 @@ __all__ = [
     "ConstraintGateDecision",
     "ConstraintGateDiagnostics",
     "ConstraintOverrideRecord",
+    "GateViolation",
     "GateVerdict",
     "PipelineCheckResult",
     "PipelineOutput",

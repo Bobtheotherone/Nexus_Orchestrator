@@ -22,6 +22,7 @@ Non-functional requirements
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from typing import cast
 
 from nexus_orchestrator.domain import (
     Constraint,
@@ -96,6 +97,9 @@ def test_must_constraint_violation_rejects() -> None:
     assert decision.verdict is GateVerdict.REJECT
     assert "must_constraint_unsatisfied" in decision.reason_codes
     assert decision.diagnostics.uncovered_must_constraints == (must_constraint.id,)
+    assert any(
+        item.code == "gate.must_constraint_unsatisfied" for item in decision.aggregated_violations
+    )
 
 
 def test_should_constraint_requires_explicit_override() -> None:
@@ -137,6 +141,10 @@ def test_should_constraint_requires_explicit_override() -> None:
     )
     assert overridden.verdict is GateVerdict.ACCEPT
     assert overridden.diagnostics.overridden_should_constraints == (should_constraint.id,)
+    assert any(
+        item.code == "gate.should_constraint_overridden"
+        for item in overridden.aggregated_violations
+    )
 
 
 def test_missing_checker_mapping_rejects_no_silent_pass() -> None:
@@ -249,7 +257,17 @@ def test_diagnostics_payload_is_stably_sorted_and_informative() -> None:
     payload_a = decision.to_feedback_payload()
     payload_b = decision.to_feedback_payload()
     assert payload_a == payload_b
+    assert "aggregated_violations" in payload_a
+    assert "evidence_records" in payload_a
 
-    failed_constraints = [item["constraint_id"] for item in payload_a["constraint_assessments"]]
+    assessments = payload_a["constraint_assessments"]
+    assert isinstance(assessments, list)
+    failed_constraints = [
+        item["constraint_id"]
+        for item in cast("list[dict[str, str]]", assessments)
+        if "constraint_id" in item
+    ]
     assert failed_constraints == sorted(failed_constraints)
-    assert "must_constraint_unsatisfied" in payload_a["reason_codes"]
+    reason_codes = payload_a["reason_codes"]
+    assert isinstance(reason_codes, list)
+    assert "must_constraint_unsatisfied" in reason_codes

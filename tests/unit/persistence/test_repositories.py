@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING
 import pytest
 
 from nexus_orchestrator.domain import ids
-from nexus_orchestrator.domain.models import RunStatus, WorkItem, WorkItemStatus
+from nexus_orchestrator.domain.models import JSONValue, RunStatus, WorkItem, WorkItemStatus
 from nexus_orchestrator.persistence.repositories import (
     AttemptRepo,
     ConstraintRepo,
@@ -86,7 +86,9 @@ def test_transaction_atomicity_with_fk_failure_rolls_back_partial_rows(tmp_path:
         (run.id, parent.id, valid_child.id),
     )
     assert edge_row is not None
-    assert int(edge_row["edge_count"]) == 1
+    edge_count = edge_row["edge_count"]
+    assert edge_count is not None
+    assert int(edge_count) == 1
 
 
 def test_fk_and_status_invariants_are_enforced(tmp_path: Path) -> None:
@@ -303,14 +305,14 @@ if _HYPOTHESIS_AVAILABLE:
         max_size=8,
     ).filter(lambda key: key not in {"token", "secret", "password", "api_key", "authorization"})
 
-    _SCALAR = st.one_of(
+    _SCALAR: st.SearchStrategy[JSONValue] = st.one_of(
         st.none(),
         st.booleans(),
         st.integers(min_value=-100, max_value=100),
         st.text(alphabet="abcdefghijklmnopqrstuvwxyz0123456789", min_size=0, max_size=20),
     )
 
-    _JSON_OBJECT = st.recursive(
+    _JSON_OBJECT: st.SearchStrategy[JSONValue] = st.recursive(
         _SCALAR,
         lambda child: st.one_of(
             st.lists(child, max_size=4),
@@ -320,7 +322,7 @@ if _HYPOTHESIS_AVAILABLE:
     )
 
     @st.composite
-    def _dag_case(draw):
+    def _dag_case(draw: st.DrawFn) -> tuple[int, tuple[tuple[int, int], ...]]:
         node_count = draw(st.integers(min_value=3, max_value=6))
         candidates = [(i, j) for i in range(node_count) for j in range(i + 1, node_count)]
         max_edges = min(len(candidates), node_count + 3)
@@ -335,7 +337,7 @@ if _HYPOTHESIS_AVAILABLE:
         suppress_health_check=[HealthCheck.function_scoped_fixture],
     )
     def test_property_work_item_constraint_parameters_roundtrip(
-        metadata: dict[str, object],
+        metadata: dict[str, JSONValue],
         tmp_path: Path,
     ) -> None:
         digest = hashlib.sha1(
@@ -393,7 +395,8 @@ if _HYPOTHESIS_AVAILABLE:
         for idx, item in enumerate(base_items):
             dependencies = [id_by_index[parent] for parent, child in edges if child == idx]
             payload = item.to_dict()
-            payload["dependencies"] = dependencies
+            dependency_values: list[JSONValue] = [dependency for dependency in dependencies]
+            payload["dependencies"] = dependency_values
             items.append(WorkItem.from_dict(payload))
 
         run = make_run(69_999, work_item_ids=tuple(id_by_index), status=RunStatus.RUNNING)

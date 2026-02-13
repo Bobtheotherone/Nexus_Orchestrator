@@ -42,6 +42,8 @@ from nexus_orchestrator.verification_plane.pipeline import (
     CheckerContext,
     EarlyExitPolicy,
     PipelineRequest,
+    PipelineSelectionContext,
+    PipelineStage,
     VerificationPipelineEngine,
     VerificationSelectionMode,
 )
@@ -224,13 +226,16 @@ async def test_incremental_vs_full_selection_hooks_and_artifact_payloads() -> No
     incremental_calls: list[str] = []
     full_calls: list[str] = []
 
-    def incremental_hook(stage, _context):
+    def incremental_hook(
+        stage: PipelineStage,
+        _context: PipelineSelectionContext,
+    ) -> tuple[str, ...]:
         incremental_calls.append(stage.stage_id)
         if stage.stage_id == SECURITY_STAGE_ID:
             return ()
         return stage.checker_ids
 
-    def full_hook(stage, _context):
+    def full_hook(stage: PipelineStage, _context: PipelineSelectionContext) -> tuple[str, ...]:
         full_calls.append(stage.stage_id)
         return stage.checker_ids
 

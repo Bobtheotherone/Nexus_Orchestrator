@@ -92,6 +92,7 @@ class SecurityChecker(BaseChecker):
             "secret_scan": {},
             "dependency_audit": {},
         }
+        command_lines: list[str] = []
 
         tool_versions: dict[str, str] = {
             "security_checker": "builtin-1",
@@ -111,14 +112,23 @@ class SecurityChecker(BaseChecker):
 
         dep_timed_out = False
         if scan_type in {"dependency_audit", "all"}:
+            dep_required = (
+                bool(params.get("dependency_audit_required"))
+                if isinstance(params.get("dependency_audit_required"), bool)
+                else (_DEP_AUDIT_CONSTRAINT in covered_constraint_ids)
+            )
             dep_violations, dep_report, dep_versions, dep_timed_out = await _run_dependency_audit(
                 context=context,
                 params=params,
                 timeout_seconds=timeout_seconds,
+                required=dep_required,
             )
             violations.extend(dep_violations)
             report["dependency_audit"] = dep_report
             tool_versions.update(dep_versions)
+            dep_command = dep_report.get("command")
+            if isinstance(dep_command, list) and all(isinstance(item, str) for item in dep_command):
+                command_lines.append(" ".join(dep_command))
 
         report_path, report_write_error = _write_report(
             workspace_root=Path(context.workspace_path),
@@ -157,6 +167,7 @@ class SecurityChecker(BaseChecker):
             "timeout_seconds": timeout_seconds,
             "violation_count": len(violations),
         }
+        duration_ms = max(int(round((time.monotonic() - started) * 1000)), 0)
 
         return CheckResult(
             status=status,
@@ -165,7 +176,8 @@ class SecurityChecker(BaseChecker):
             tool_versions={key: tool_versions[key] for key in sorted(tool_versions)},
             artifact_paths=artifact_paths,
             logs_path=None,
-            duration_ms=0,
+            command_lines=tuple(command_lines),
+            duration_ms=duration_ms,
             metadata=metadata,
             checker_id=self.checker_id,
             stage=self.stage,
@@ -260,10 +272,10 @@ async def _run_dependency_audit(
     context: CheckerContext,
     params: Mapping[str, object],
     timeout_seconds: float,
+    required: bool,
 ) -> tuple[list[Violation], dict[str, object], dict[str, str], bool]:
     raw_command = params.get("dependency_audit_command", ("pip-audit", "-f", "json"))
     command = _to_command(raw_command, default=("pip-audit", "-f", "json"))
-    required = _as_bool(params.get("dependency_audit_required"), default=False)
 
     spec = CommandSpec(
         argv=command,

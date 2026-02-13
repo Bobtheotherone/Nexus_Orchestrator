@@ -61,6 +61,7 @@ class CheckStatus(StrEnum):
 
     PASS = "pass"
     FAIL = "fail"
+    WARN = "warn"
     ERROR = "error"
     TIMEOUT = "timeout"
     SKIP = "skip"
@@ -147,6 +148,7 @@ class CheckResult:
     tool_versions: dict[str, str] = field(default_factory=dict)
     artifact_paths: tuple[str, ...] = ()
     logs_path: str | None = None
+    command_lines: tuple[str, ...] = ()
     duration_ms: int = 0
     metadata: dict[str, JSONValue] = field(default_factory=dict)
     checker_id: str = ""
@@ -168,6 +170,7 @@ class CheckResult:
         )
         self.artifact_paths = normalize_artifact_paths(self.artifact_paths)
         self.logs_path = _as_optional_str(self.logs_path, "CheckResult.logs_path", max_len=2048)
+        self.command_lines = normalize_command_lines(self.command_lines)
         self.duration_ms = _as_int(self.duration_ms, "CheckResult.duration_ms", minimum=0)
         self.metadata = _canonicalize_json_object(self.metadata, "CheckResult.metadata")
         self.checker_id = _as_str(self.checker_id, "CheckResult.checker_id", max_len=128)
@@ -183,6 +186,7 @@ class CheckResult:
             "tool_versions": dict(self.tool_versions),
             "artifact_paths": list(self.artifact_paths),
             "logs_path": self.logs_path,
+            "command_lines": list(self.command_lines),
             "duration_ms": self.duration_ms,
             "metadata": self.metadata,
             "checker_id": self.checker_id,
@@ -592,6 +596,15 @@ def normalize_artifact_paths(paths: Iterable[str]) -> tuple[str, ...]:
     return tuple(sorted(normalized))
 
 
+def normalize_command_lines(command_lines: Iterable[str]) -> tuple[str, ...]:
+    """Return unique command line strings with deterministic lexical ordering."""
+
+    normalized: set[str] = set()
+    for index, item in enumerate(command_lines):
+        normalized.add(_as_str(item, f"command_lines[{index}]", max_len=4096))
+    return tuple(sorted(normalized))
+
+
 @dataclass(slots=True)
 class _CommandTimeoutError(Exception):
     stdout: bytes
@@ -917,6 +930,7 @@ __all__ = [
     "RedactionHooks",
     "TextRedactor",
     "Violation",
+    "normalize_command_lines",
     "normalize_artifact_paths",
     "normalize_violations",
     "register_builtin_checker",

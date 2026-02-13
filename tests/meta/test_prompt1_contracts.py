@@ -25,23 +25,38 @@ Non-functional requirements
 
 from __future__ import annotations
 
+import importlib
 import json
 import re
 import subprocess
 import sys
 import tempfile
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol, cast
 
 import pytest
 import yaml
 from hypothesis import given, settings
 from hypothesis import strategies as st
 
+
+class _TomlLoader(Protocol):
+    def loads(self, value: str, /) -> Any: ...
+
+
+class _RepoBlueprintModule(Protocol):
+    def scan_placeholders_in_paths(
+        self,
+        repo_root: Path,
+        rel_paths: list[str],
+        protected_paths: set[str],
+    ) -> dict[str, Any]: ...
+
+
 try:
-    import tomllib
+    toml_loader = cast("_TomlLoader", importlib.import_module("tomllib"))
 except ModuleNotFoundError:  # pragma: no cover - Python 3.10 fallback for local runs.
-    import tomli as tomllib
+    toml_loader = cast("_TomlLoader", importlib.import_module("tomli"))
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SRC_PATH = REPO_ROOT / "src"
@@ -93,17 +108,17 @@ CONSTRAINT_ID_PATTERN = re.compile(r"^CON-[A-Z]{3,6}-\d{4}$")
 BUILD_ORDER_PHASE_HEADER = re.compile(r"^##\s+Phase\s+(\d+)\s+—\s+.+$")
 
 
-def _load_repo_blueprint_module() -> object:
+def _load_repo_blueprint_module() -> _RepoBlueprintModule:
     try:
         import nexus_orchestrator.repo_blueprint as module
 
-        return module
+        return cast("_RepoBlueprintModule", module)
     except ModuleNotFoundError:
         if str(SRC_PATH) not in sys.path:
             sys.path.insert(0, str(SRC_PATH))
         import nexus_orchestrator.repo_blueprint as module
 
-        return module
+        return cast("_RepoBlueprintModule", module)
 
 
 scan_placeholders_in_paths = _load_repo_blueprint_module().scan_placeholders_in_paths
@@ -134,7 +149,9 @@ def _is_pinned_or_tightly_constrained(specifier: str) -> bool:
 
 
 def _load_pyproject() -> dict[str, Any]:
-    return tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    loaded = toml_loader.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    assert isinstance(loaded, dict), "pyproject.toml must parse as a mapping."
+    return cast("dict[str, Any]", loaded)
 
 
 def _dependency_map(entries: list[str]) -> dict[str, str]:
@@ -156,9 +173,9 @@ def _workflow_on_config(workflow: dict[str, Any]) -> dict[str, Any]:
     if isinstance(on_cfg, dict):
         return on_cfg
     # YAML 1.1 loaders can coerce "on" to boolean true in unquoted mappings.
-    bool_key_cfg = workflow.get(True)
+    bool_key_cfg = cast("dict[object, Any]", workflow).get(True)
     if isinstance(bool_key_cfg, dict):
-        return bool_key_cfg
+        return cast("dict[str, Any]", bool_key_cfg)
     return {}
 
 
@@ -219,7 +236,9 @@ def _workflow_uses(workflow: dict[str, Any]) -> list[str]:
 
 
 def _load_tools_registry() -> dict[str, Any]:
-    return tomllib.loads((REPO_ROOT / "tools/registry.toml").read_text(encoding="utf-8"))
+    loaded = toml_loader.loads((REPO_ROOT / "tools/registry.toml").read_text(encoding="utf-8"))
+    assert isinstance(loaded, dict), "tools/registry.toml must parse as a mapping."
+    return cast("dict[str, Any]", loaded)
 
 
 def _makefile_commands() -> str:

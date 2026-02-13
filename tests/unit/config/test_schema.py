@@ -23,6 +23,7 @@ Non-functional requirements
 from __future__ import annotations
 
 import tomllib
+from collections.abc import Mapping
 from pathlib import Path
 
 from nexus_orchestrator.config.schema import (
@@ -43,6 +44,15 @@ def _load_toml(path: Path) -> dict[str, object]:
     return data
 
 
+def _as_object_dict(value: object) -> dict[str, object]:
+    assert isinstance(value, Mapping)
+    normalized: dict[str, object] = {}
+    for key, item in value.items():
+        assert isinstance(key, str)
+        normalized[key] = item
+    return normalized
+
+
 def test_orchestrator_toml_validates_successfully() -> None:
     config = _load_toml(REPO_ROOT / "orchestrator.toml")
 
@@ -55,7 +65,7 @@ def test_orchestrator_toml_validates_successfully() -> None:
 
 def test_unknown_key_rejection_is_explicit() -> None:
     config = _load_toml(REPO_ROOT / "orchestrator.toml")
-    providers = dict(config["providers"])
+    providers = _as_object_dict(config["providers"])
     providers["unknown_provider"] = {"api_key_env": "NEXUS_UNKNOWN_KEY"}
     config["providers"] = providers
 
@@ -67,7 +77,7 @@ def test_unknown_key_rejection_is_explicit() -> None:
 
 def test_type_validation_reports_structured_paths() -> None:
     config = _load_toml(REPO_ROOT / "orchestrator.toml")
-    budgets = dict(config["budgets"])
+    budgets = _as_object_dict(config["budgets"])
     budgets["max_iterations"] = "three"
     config["budgets"] = budgets
 
@@ -81,7 +91,7 @@ def test_type_validation_reports_structured_paths() -> None:
 
 def test_range_violation_reports_exact_path() -> None:
     config = _load_toml(REPO_ROOT / "orchestrator.toml")
-    budgets = dict(config["budgets"])
+    budgets = _as_object_dict(config["budgets"])
     budgets["max_iterations"] = 0
     config["budgets"] = budgets
 
@@ -174,8 +184,8 @@ may_relax_should_constraints = false
 
 def test_profile_overlay_deep_merges_known_sections_and_revalidates() -> None:
     config = _load_toml(REPO_ROOT / "orchestrator.toml")
-    profiles = dict(config["profiles"])
-    strict_overlay = dict(profiles["strict"])
+    profiles = _as_object_dict(config["profiles"])
+    strict_overlay = _as_object_dict(profiles["strict"])
     strict_overlay["budgets"] = {"max_iterations": 3}
     profiles["strict"] = strict_overlay
     config["profiles"] = profiles

@@ -197,6 +197,7 @@ class ReliabilityChecker(BaseChecker):
             ],
             "timeout_seconds": timeout_seconds,
         }
+        duration_ms = max(int(round((time.monotonic() - started) * 1000)), 0)
 
         return CheckResult(
             status=status,
@@ -205,7 +206,8 @@ class ReliabilityChecker(BaseChecker):
             tool_versions={"reliability_checker": "builtin-1"},
             artifact_paths=(),
             logs_path=None,
-            duration_ms=0,
+            command_lines=(),
+            duration_ms=duration_ms,
             metadata=metadata,
             checker_id=self.checker_id,
             stage=self.stage,

@@ -23,6 +23,7 @@ Non-functional requirements
 from __future__ import annotations
 
 import re
+from collections.abc import Mapping
 
 import pytest
 
@@ -38,10 +39,15 @@ from nexus_orchestrator.security.redaction import (
 )
 
 
+def _as_object_mapping(value: object) -> Mapping[str, object]:
+    assert isinstance(value, Mapping)
+    return value
+
+
 def test_key_based_redaction_masks_sensitive_values() -> None:
     value = {"api_key": "sk-THISISFAKE1234567890", "safe": "visible"}
 
-    redacted = redact_structure(value)
+    redacted = _as_object_mapping(redact_structure(value))
 
     assert redacted["api_key"] == REDACTED_VALUE
     assert redacted["safe"] == "visible"
@@ -89,16 +95,20 @@ def test_false_positive_restraint_for_common_words() -> None:
 def test_allowlist_only_overrides_when_policy_allows() -> None:
     payload = {"api_key": "sk-THISISFAKE1234567890"}
 
-    safe_default = redact_structure(
-        payload,
-        config=RedactionConfig(key_allowlist=frozenset({"api_key"})),
+    safe_default = _as_object_mapping(
+        redact_structure(
+            payload,
+            config=RedactionConfig(key_allowlist=frozenset({"api_key"})),
+        )
     )
-    override_allowed = redact_structure(
-        payload,
-        config=RedactionConfig(
-            key_allowlist=frozenset({"api_key"}),
-            allowlist_can_override=True,
-        ),
+    override_allowed = _as_object_mapping(
+        redact_structure(
+            payload,
+            config=RedactionConfig(
+                key_allowlist=frozenset({"api_key"}),
+                allowlist_can_override=True,
+            ),
+        )
     )
 
     assert safe_default["api_key"] == REDACTED_VALUE

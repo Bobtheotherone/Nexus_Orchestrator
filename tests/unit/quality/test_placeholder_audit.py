@@ -29,8 +29,14 @@ import re
 import tempfile
 from pathlib import Path
 from random import Random
+from typing import TYPE_CHECKING
 
 from nexus_orchestrator.quality import placeholder_audit
+
+if TYPE_CHECKING:
+    from collections.abc import Mapping, Sequence
+
+    import pytest
 
 try:
     from hypothesis import given, seed, settings
@@ -53,6 +59,10 @@ def _scan(
     roots: tuple[str, ...] = ("src",),
     exclude: tuple[str, ...] = (),
     show_context: int = 2,
+    include_docstrings: bool = False,
+    include_string_literals: bool = False,
+    scan_tests_as_blocking: bool = False,
+    severity_by_path: (Mapping[str, str] | Sequence[str] | Sequence[tuple[str, str]] | None) = None,
     warn_on_string_markers: bool = False,
     warn_on_audit_tool_self_references: bool = False,
     self_reference_allowlist: tuple[str, ...] = placeholder_audit.DEFAULT_SELF_REFERENCE_ALLOWLIST,
@@ -62,6 +72,10 @@ def _scan(
         roots=roots,
         exclude=exclude,
         show_context=show_context,
+        include_docstrings=include_docstrings,
+        include_string_literals=include_string_literals,
+        scan_tests_as_blocking=scan_tests_as_blocking,
+        severity_by_path=severity_by_path,
         warn_on_string_markers=warn_on_string_markers,
         warn_on_audit_tool_self_references=warn_on_audit_tool_self_references,
         self_reference_allowlist=self_reference_allowlist,
@@ -132,8 +146,10 @@ def test_string_literals_are_suppressed_by_default(tmp_path: Path) -> None:
         tmp_path,
         "src/ambiguous.py",
         (
+            "import re\n\n"
             "PATTERN = r'TODO|FIXME|NotImplementedError'\n"
             "MESSAGE = 'NotImplementedError appears in content, not code flow'\n"
+            "COMPILED = re.compile(r'raise\\s+NotImplementedError')\n"
         ),
     )
 
@@ -142,6 +158,81 @@ def test_string_literals_are_suppressed_by_default(tmp_path: Path) -> None:
     assert result.error_count == 0
     assert result.warning_count == 0
     assert "placeholder_string_literal" not in _kinds(result, "WARNING")
+
+
+def test_todo_comment_in_tests_is_warning_by_default(tmp_path: Path) -> None:
+    _write(tmp_path, "tests/unit/test_warning_case.py", "# TODO: fixture follow-up\n")
+
+    result = _scan(tmp_path, roots=("tests",), exclude=())
+
+    assert result.error_count == 0
+    assert result.warning_count == 1
+    assert _kinds(result, "ERROR") == set()
+    assert _kinds(result, "WARNING") == {"todo_fixme_comment"}
+    assert result.findings[0].path == "tests/unit/test_warning_case.py"
+
+
+def test_todo_comment_in_tests_can_be_blocking_by_policy(tmp_path: Path) -> None:
+    _write(tmp_path, "tests/unit/test_warning_case.py", "# TODO: fixture follow-up\n")
+
+    result = _scan(tmp_path, roots=("tests",), exclude=(), scan_tests_as_blocking=True)
+
+    assert result.error_count == 1
+    assert result.warning_count == 0
+    assert _kinds(result, "ERROR") == {"todo_fixme_comment"}
+
+
+def test_fixture_strings_in_tests_are_not_blocking_by_default(tmp_path: Path) -> None:
+    _write(
+        tmp_path,
+        "tests/unit/test_fixture_payloads.py",
+        (
+            "import re\n\n"
+            "FIXTURE_TEXT = 'TODO/FIXME/NotImplementedError fixture payload sample'\n"
+            "PATTERN = r'TODO|FIXME|NotImplementedError'\n"
+            "MATCHER = re.compile(r'raise\\s+NotImplementedError')\n"
+        ),
+    )
+
+    result = _scan(tmp_path, roots=("tests",), exclude=())
+
+    assert result.error_count == 0
+    assert result.warning_count == 0
+    assert result.findings == ()
+
+
+def test_docstring_markers_are_opt_in(tmp_path: Path) -> None:
+    _write(
+        tmp_path,
+        "src/docstrings.py",
+        (
+            '"""TODO: module docs marker"""\n\n'
+            "def build() -> None:\n"
+            '    """FIXME: function docs marker"""\n'
+            "    return None\n"
+        ),
+    )
+
+    default_result = _scan(tmp_path, include_string_literals=True)
+    opt_in_result = _scan(tmp_path, include_string_literals=True, include_docstrings=True)
+
+    assert default_result.error_count == 0
+    assert default_result.warning_count == 0
+    assert not default_result.findings
+
+    assert opt_in_result.error_count == 0
+    assert opt_in_result.warning_count == 2
+    assert _kinds(opt_in_result, "WARNING") == {"placeholder_string_literal"}
+
+
+def test_path_severity_override_can_demote_src_comment(tmp_path: Path) -> None:
+    _write(tmp_path, "src/example.py", "# TODO: demote to warning\n")
+
+    result = _scan(tmp_path, severity_by_path=("src/**=WARNING", "**=WARNING"))
+
+    assert result.error_count == 0
+    assert result.warning_count == 1
+    assert _kinds(result, "WARNING") == {"todo_fixme_comment"}
 
 
 def test_warn_on_string_markers_emits_warning_with_context(tmp_path: Path) -> None:
@@ -223,7 +314,7 @@ def test_self_reference_allowlist_suppresses_and_flag_enables_deterministically(
 
 
 def test_tests_meta_is_excluded_by_default_and_included_when_requested(tmp_path: Path) -> None:
-    _write(tmp_path, "docs/guide.md", "TODO: docs token\n")
+    _write(tmp_path, "docs/guide.md", "# TODO: docs token\n")
     _write(tmp_path, "tests/meta/fixture.py", "# TODO: meta fixture token\n")
 
     default_result = _scan(
@@ -295,7 +386,9 @@ def test_text_and_json_output_include_required_audit_fields(tmp_path: Path) -> N
     )
 
 
-def test_cli_wires_string_marker_and_self_reference_flags(tmp_path: Path, monkeypatch) -> None:
+def test_cli_wires_string_marker_and_self_reference_flags(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     warning_root = tmp_path / "warning_repo"
     rel_path = "src/tooling/string_markers.py"
     _write(warning_root, rel_path, "PATTERN = 'TODO in string'\n")
@@ -344,7 +437,7 @@ if HYPOTHESIS_AVAILABLE:
 
     @settings(max_examples=30, derandomize=True, deadline=None)
     @seed(20260213)
-    @given(keyword=st.sampled_from(("TODO", "FIXME", "NotImplementedError")))
+    @given(keyword=st.sampled_from(("TODO", "FIXME")))
     def test_property_string_keywords_default_suppressed_then_warn_when_enabled(
         keyword: str,
     ) -> None:
@@ -376,7 +469,7 @@ else:
         tmp_path: Path,
     ) -> None:
         rng = Random(20260213)
-        keywords = ("TODO", "FIXME", "NotImplementedError")
+        keywords = ("TODO", "FIXME")
 
         for _ in range(40):
             keyword = keywords[rng.randrange(0, len(keywords))]

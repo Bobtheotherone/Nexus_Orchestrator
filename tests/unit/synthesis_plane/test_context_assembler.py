@@ -55,6 +55,7 @@ from nexus_orchestrator.synthesis_plane.context_assembler import (
 )
 
 if TYPE_CHECKING:
+    from collections.abc import Callable, Mapping, Sequence
     from pathlib import Path
 
 try:
@@ -63,7 +64,7 @@ except ImportError:
     UTC = timezone.utc  # noqa: UP017
 
 
-def _randbytes(seed: int):
+def _randbytes(seed: int) -> Callable[[int], bytes]:
     byte = (seed % 251) + 1
 
     def provider(size: int) -> bytes:
@@ -130,8 +131,11 @@ class _FakeIndexer:
     def __init__(self) -> None:
         self.calls: list[tuple[str, ...] | None] = []
 
-    def build(self, *, changed_paths: tuple[str, ...] | None = None) -> dict[str, object]:
-        self.calls.append(changed_paths)
+    def build(self, *, changed_paths: Sequence[str] | None = None) -> object:
+        if changed_paths is None:
+            self.calls.append(None)
+        else:
+            self.calls.append(tuple(changed_paths))
         return {"build_number": len(self.calls)}
 
 
@@ -146,9 +150,9 @@ class _FakeRetriever:
         work_item: WorkItem,
         index: object,
         token_budget: int,
-        changed_paths: tuple[str, ...],
-        preferred_contract_paths: tuple[str, ...],
-    ) -> tuple[ContextDoc, ...]:
+        changed_paths: Sequence[str],
+        preferred_contract_paths: Sequence[str],
+    ) -> object:
         self.calls.append(
             {
                 "work_item_id": work_item.id,
@@ -171,9 +175,9 @@ class _RepositoryIndexerRetriever:
         work_item: WorkItem,
         index: object,
         token_budget: int,
-        changed_paths: tuple[str, ...],
-        preferred_contract_paths: tuple[str, ...],
-    ) -> tuple[ContextDoc, ...]:
+        changed_paths: Sequence[str],
+        preferred_contract_paths: Sequence[str],
+    ) -> object:
         del token_budget, changed_paths, preferred_contract_paths
         if not isinstance(index, RepositoryIndexer):
             raise TypeError("expected RepositoryIndexer index snapshot")
@@ -203,6 +207,18 @@ def _doc(path: str, *, doc_type: str, content: str, why: str) -> ContextDoc:
         content_hash="f" * 64,
         why_included=why,
         metadata={"bytes_total": len(content.encode("utf-8"))},
+    )
+
+
+def _audit_row_sort_key(row: Mapping[str, object]) -> tuple[int, str, str, str]:
+    order_value = row["order"]
+    if not isinstance(order_value, int):
+        raise TypeError("manifest row order must be an int")
+    return (
+        order_value,
+        str(row["path"]),
+        str(row["doc_type"]),
+        str(row["content_hash"]),
     )
 
 
@@ -302,12 +318,7 @@ def test_assembler_is_deterministic_and_reuses_cached_index_snapshot() -> None:
     assert first_audit
     assert first_audit == sorted(
         first_audit,
-        key=lambda row: (
-            int(row["order"]),
-            str(row["path"]),
-            str(row["doc_type"]),
-            str(row["content_hash"]),
-        ),
+        key=_audit_row_sort_key,
     )
     first_json = json.dumps(first_audit, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
     second_json = json.dumps(

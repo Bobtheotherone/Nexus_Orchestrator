@@ -34,7 +34,7 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Final
 
-import yaml  # type: ignore[import-untyped]
+import yaml
 
 from nexus_orchestrator.config.schema import validate_config
 from nexus_orchestrator.verification_plane.checkers.base import (
@@ -239,6 +239,7 @@ class SchemaChecker(BaseChecker):
             if not any(v.severity.lower() == "error" for v in violations)
             else CheckStatus.FAIL
         )
+        duration_ms = max(int(round((time.monotonic() - started) * 1000)), 0)
 
         return CheckResult(
             status=status,
@@ -251,7 +252,8 @@ class SchemaChecker(BaseChecker):
             },
             artifact_paths=normalize_artifact_paths((report_path,)) if report_path else (),
             logs_path=None,
-            duration_ms=0,
+            command_lines=(),
+            duration_ms=duration_ms,
             metadata={
                 "targets": list(targets),
                 "issue_count": len(ordered_issues),

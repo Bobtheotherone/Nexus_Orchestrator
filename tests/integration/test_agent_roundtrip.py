@@ -26,6 +26,7 @@ import subprocess
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from nexus_orchestrator.domain import ids
 from nexus_orchestrator.domain.models import (
@@ -63,13 +64,16 @@ from nexus_orchestrator.synthesis_plane.dispatch import (
     ProviderUsage,
 )
 
+if TYPE_CHECKING:
+    from collections.abc import Callable, Sequence
+
 try:
     from datetime import UTC
 except ImportError:
     UTC = timezone.utc  # noqa: UP017
 
 
-def _randbytes(seed: int):
+def _randbytes(seed: int) -> Callable[[int], bytes]:
     byte = (seed % 251) + 1
 
     def provider(size: int) -> bytes:
@@ -87,7 +91,7 @@ def _write(path: Path, content: str) -> None:
 class _IndexerAdapter:
     indexer: RepositoryIndexer
 
-    def build(self, *, changed_paths: tuple[str, ...] | None = None) -> RepositoryIndexer:
+    def build(self, *, changed_paths: Sequence[str] | None = None) -> object:
         if changed_paths is None:
             self.indexer.reindex()
         else:
@@ -103,12 +107,14 @@ class _RetrieverAdapter:
         self,
         *,
         work_item: WorkItem,
-        index: RepositoryIndexer,
+        index: object,
         token_budget: int,
-        changed_paths: tuple[str, ...],
-        preferred_contract_paths: tuple[str, ...],
-    ) -> tuple[ContextDoc, ...]:
+        changed_paths: Sequence[str],
+        preferred_contract_paths: Sequence[str],
+    ) -> object:
         del changed_paths, preferred_contract_paths
+        if not isinstance(index, RepositoryIndexer):
+            raise TypeError("expected RepositoryIndexer index snapshot")
         scope_set = set(work_item.scope)
         scope_stems = {Path(item).stem for item in work_item.scope}
         candidates: list[RetrievalCandidate] = []

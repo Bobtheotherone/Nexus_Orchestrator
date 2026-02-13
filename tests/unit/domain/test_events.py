@@ -100,12 +100,20 @@ def test_redact_sensitive_is_deep_and_non_mutating() -> None:
     assert nested["apiKey"] == "***REDACTED***"
     nested_items = nested["items"]
     assert isinstance(nested_items, list)
-    assert nested_items[0]["password"] == "***REDACTED***"
-    assert nested_items[1]["session"]["client_secret"] == "***REDACTED***"
+    first_item = nested_items[0]
+    assert isinstance(first_item, dict)
+    assert first_item["password"] == "***REDACTED***"
+    second_item = nested_items[1]
+    assert isinstance(second_item, dict)
+    session = second_item["session"]
+    assert isinstance(session, dict)
+    assert session["client_secret"] == "***REDACTED***"
     assert redacted.payload["safe_value"] == "visible"
 
     assert original.payload["token"] == "abc"
-    assert original.payload["nested"]["apiKey"] == "secret-value"
+    original_nested = original.payload["nested"]
+    assert isinstance(original_nested, dict)
+    assert original_nested["apiKey"] == "secret-value"
 
 
 def test_timestamp_validation_and_default_presence() -> None:

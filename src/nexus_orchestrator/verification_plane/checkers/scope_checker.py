@@ -33,6 +33,7 @@ from __future__ import annotations
 import fnmatch
 import json
 import re
+import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
@@ -121,60 +122,84 @@ class GitScopeChangeProvider:
         context: CheckerContext,
         timeout_seconds: float,
     ) -> tuple[ChangedPath, ...]:
-        result = await context.require_executor().run(
+        diff_result = await context.require_executor().run(
             CommandSpec(
                 argv=(
                     "git",
                     "-c",
                     "core.quotepath=off",
-                    "status",
-                    "--porcelain=1",
-                    "--untracked-files=all",
+                    "diff",
+                    "--name-status",
+                    "--find-renames",
+                    "--diff-filter=ACDMRTUXB",
+                    "--relative",
+                    "HEAD",
                 ),
                 cwd=context.workspace_path,
                 timeout_seconds=timeout_seconds,
             )
         )
 
-        if result.timed_out:
-            raise TimeoutError(f"git status timed out after {timeout_seconds:.3f}s")
-        if result.error is not None:
-            raise RuntimeError(result.error)
-        if result.exit_code not in (0, None):
-            message = result.stderr.strip() or result.stdout.strip() or "git status failed"
+        if diff_result.timed_out:
+            raise TimeoutError(f"git diff timed out after {timeout_seconds:.3f}s")
+        if diff_result.error is not None:
+            raise RuntimeError(diff_result.error)
+        if diff_result.exit_code not in (0, None):
+            message = diff_result.stderr.strip() or diff_result.stdout.strip() or "git diff failed"
+            if _is_missing_head_error(message):
+                raise RuntimeError(
+                    "git HEAD is unavailable; create an initial commit or pass config.changed_files"
+                )
+            raise RuntimeError(message)
+
+        untracked_result = await context.require_executor().run(
+            CommandSpec(
+                argv=("git", "ls-files", "--others", "--exclude-standard"),
+                cwd=context.workspace_path,
+                timeout_seconds=timeout_seconds,
+            )
+        )
+        if untracked_result.timed_out:
+            raise TimeoutError(f"git ls-files timed out after {timeout_seconds:.3f}s")
+        if untracked_result.error is not None:
+            raise RuntimeError(untracked_result.error)
+        if untracked_result.exit_code not in (0, None):
+            message = (
+                untracked_result.stderr.strip()
+                or untracked_result.stdout.strip()
+                or "git ls-files failed"
+            )
             raise RuntimeError(message)
 
         entries: list[ChangedPath] = []
-        for raw_line in result.stdout.splitlines():
+        for raw_line in diff_result.stdout.splitlines():
             line = raw_line.rstrip("\n")
             if not line:
                 continue
-            if line.startswith("?? "):
-                path = line[3:].strip()
-                if path:
-                    entries.append(ChangedPath(path=path, kind="added"))
+            parts = [segment.strip() for segment in line.split("\t") if segment.strip()]
+            if len(parts) < 2:
                 continue
 
-            if len(line) < 4:
+            status = parts[0]
+            kind = _kind_from_name_status(status)
+            if kind is None:
                 continue
-            status = line[:2]
-            payload = line[3:].strip()
-            if not payload:
-                continue
-
-            if "->" in payload:
-                old_path, new_path = payload.split("->", maxsplit=1)
-                old_clean = old_path.strip()
-                new_clean = new_path.strip()
-                if old_clean:
-                    entries.append(ChangedPath(path=old_clean, kind="deleted"))
-                if new_clean:
-                    entries.append(ChangedPath(path=new_clean, kind="added"))
+            if status.startswith("R") and len(parts) >= 3:
+                old_path = parts[1]
+                new_path = parts[2]
+                if old_path:
+                    entries.append(ChangedPath(path=old_path, kind="deleted"))
+                if new_path:
+                    entries.append(ChangedPath(path=new_path, kind="added"))
                 continue
 
-            kind = _kind_from_porcelain(status)
-            if kind is not None:
-                entries.append(ChangedPath(path=payload, kind=kind))
+            path = parts[-1]
+            entries.append(ChangedPath(path=path, kind=kind))
+
+        for raw_line in untracked_result.stdout.splitlines():
+            path = raw_line.strip()
+            if path:
+                entries.append(ChangedPath(path=path, kind="added"))
 
         deduped = {
             (item.path.replace("\\", "/"), item.kind): ChangedPath(
@@ -200,6 +225,7 @@ class ScopeChecker(BaseChecker):
         )
 
     async def check(self, context: CheckerContext) -> CheckResult:
+        started = time.monotonic()
         params = checker_parameters(context, self.checker_id)
         covered_constraint_ids = extract_constraint_ids(
             context,
@@ -217,6 +243,7 @@ class ScopeChecker(BaseChecker):
                 timeout_seconds=timeout_seconds,
             )
         except TimeoutError:
+            duration_ms = max(int(round((time.monotonic() - started) * 1000)), 0)
             return CheckResult(
                 status=CheckStatus.TIMEOUT,
                 violations=(
@@ -230,12 +257,18 @@ class ScopeChecker(BaseChecker):
                 tool_versions=await _tool_versions(context, timeout_seconds),
                 artifact_paths=(),
                 logs_path=None,
-                duration_ms=0,
+                command_lines=(
+                    "git -c core.quotepath=off diff --name-status --find-renames "
+                    "--diff-filter=ACDMRTUXB --relative HEAD",
+                    "git ls-files --others --exclude-standard",
+                ),
+                duration_ms=duration_ms,
                 metadata={"timeout_seconds": timeout_seconds},
                 checker_id=self.checker_id,
                 stage=self.stage,
             )
         except Exception as exc:  # noqa: BLE001
+            duration_ms = max(int(round((time.monotonic() - started) * 1000)), 0)
             return CheckResult(
                 status=CheckStatus.ERROR,
                 violations=(
@@ -249,7 +282,12 @@ class ScopeChecker(BaseChecker):
                 tool_versions=await _tool_versions(context, timeout_seconds),
                 artifact_paths=(),
                 logs_path=None,
-                duration_ms=0,
+                command_lines=(
+                    "git -c core.quotepath=off diff --name-status --find-renames "
+                    "--diff-filter=ACDMRTUXB --relative HEAD",
+                    "git ls-files --others --exclude-standard",
+                ),
+                duration_ms=duration_ms,
                 metadata={"timeout_seconds": timeout_seconds},
                 checker_id=self.checker_id,
                 stage=self.stage,
@@ -292,6 +330,10 @@ class ScopeChecker(BaseChecker):
         violations.extend(rule_violations)
         violations.extend(unsafe_violations)
 
+        override_applied = (
+            bool(out_of_scope) and override_record is not None and override_record.valid
+        )
+
         for entry in out_of_scope:
             violations.append(
                 Violation(
@@ -299,12 +341,10 @@ class ScopeChecker(BaseChecker):
                     code="scope.out_of_bounds",
                     message=f"{entry['kind']} path violates scope allowlist",
                     path=entry["path"],
+                    severity="warning" if override_applied else "error",
                 )
             )
 
-        override_applied = (
-            bool(out_of_scope) and override_record is not None and override_record.valid
-        )
         if bool(out_of_scope) and not override_applied:
             violations.append(
                 Violation(
@@ -355,7 +395,23 @@ class ScopeChecker(BaseChecker):
             )
 
         has_blocking = any(item.severity.lower() == "error" for item in violations)
-        status = CheckStatus.FAIL if has_blocking else CheckStatus.PASS
+        if has_blocking:
+            status = CheckStatus.FAIL
+        elif override_applied:
+            status = CheckStatus.WARN
+        else:
+            status = CheckStatus.PASS
+        duration_ms = max(int(round((time.monotonic() - started) * 1000)), 0)
+        uses_git_commands = params.get("changed_files") is None
+        command_lines = (
+            (
+                "git -c core.quotepath=off diff --name-status --find-renames "
+                "--diff-filter=ACDMRTUXB --relative HEAD",
+                "git ls-files --others --exclude-standard",
+            )
+            if uses_git_commands
+            else ()
+        )
 
         return CheckResult(
             status=status,
@@ -364,7 +420,8 @@ class ScopeChecker(BaseChecker):
             tool_versions=await _tool_versions(context, timeout_seconds),
             artifact_paths=normalize_artifact_paths((report_path,)) if report_path else (),
             logs_path=None,
-            duration_ms=0,
+            command_lines=command_lines,
+            duration_ms=duration_ms,
             metadata=cast(
                 "dict[str, JSONValue]",
                 {
@@ -576,14 +633,31 @@ def _override_json(record: ScopeOverrideRecord | None) -> dict[str, str | bool] 
     return payload
 
 
-def _kind_from_porcelain(status: str) -> ChangeKind | None:
-    if "D" in status:
+def _kind_from_name_status(status: str) -> ChangeKind | None:
+    normalized = status.strip().upper()
+    if not normalized:
+        return None
+    if normalized.startswith("D"):
         return "deleted"
-    if "A" in status:
+    if normalized.startswith("A"):
         return "added"
-    if any(code in status for code in ("M", "R", "C", "T", "U")):
+    if normalized.startswith(("M", "R", "C", "T", "U")):
         return "modified"
     return None
+
+
+def _is_missing_head_error(message: str) -> bool:
+    normalized = message.strip().lower()
+    if "head" not in normalized:
+        return False
+    indicators = (
+        "unknown revision or path not in the working tree",
+        "ambiguous argument",
+        "bad revision",
+        "bad object",
+        "unknown revision",
+    )
+    return any(indicator in normalized for indicator in indicators)
 
 
 def _coerce_change_kind(raw: object) -> ChangeKind | None:
