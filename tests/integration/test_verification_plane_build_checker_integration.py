@@ -1,3 +1,25 @@
+"""
+nexus-orchestrator — verification plane build checker integration tests
+
+File: tests/integration/test_verification_plane_build_checker_integration.py
+Last updated: 2026-02-13
+
+Purpose
+- Validate that `BuildChecker` executes a real local build command and reports a pass result.
+
+What this test file should cover
+- End-to-end checker execution through `CheckerContext` and `LocalSubprocessExecutor`.
+- Constraint coverage propagation and tool-version reporting for successful build checks.
+
+Functional requirements
+- Must run `python -m compileall -q src` against a temporary local workspace only.
+- Must not require network access or external services.
+
+Non-functional requirements
+- Deterministic and offline: fixed inputs, no randomness, no sleeps.
+- Stable assertions and output across repeated runs in CI and WSL.
+"""
+
 from __future__ import annotations
 
 from typing import TYPE_CHECKING
