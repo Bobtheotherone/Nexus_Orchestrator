@@ -23,9 +23,13 @@ Non-functional requirements
 from __future__ import annotations
 
 from datetime import timedelta, timezone
+from typing import TYPE_CHECKING
 
 import nexus_orchestrator.observability as observability_pkg
 from nexus_orchestrator.observability.events import EventBus
+
+if TYPE_CHECKING:
+    from nexus_orchestrator.domain import NexusEvent
 
 try:
     from datetime import UTC
@@ -54,7 +58,7 @@ async def test_async_subscriber_supports_publish_async_and_sync_publish() -> Non
     bus = EventBus(buffer_size=10)
     received: list[str] = []
 
-    async def async_sub(event: object) -> None:
+    async def async_sub(event: NexusEvent) -> None:
         # type narrowed by bus internals; list append is sync and deterministic.
         received.append(event.event_type.value)
 
@@ -74,10 +78,10 @@ def test_subscriber_exception_does_not_break_other_subscribers() -> None:
     bus = EventBus(buffer_size=10)
     received: list[str] = []
 
-    def broken(_event: object) -> None:
+    def broken(_event: NexusEvent) -> None:
         raise RuntimeError("boom")
 
-    def healthy(event: object) -> None:
+    def healthy(event: NexusEvent) -> None:
         received.append(event.event_type.value)
 
     bus.subscribe(None, broken)
@@ -114,7 +118,7 @@ def test_replay_since_filter() -> None:
 def test_critical_event_persistence_callback_failure_is_recorded_and_event_replayable() -> None:
     persisted: list[str] = []
 
-    def persist(event: object) -> None:
+    def persist(event: NexusEvent) -> None:
         persisted.append(event.event_id)
         raise ValueError("db down")
 

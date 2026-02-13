@@ -26,7 +26,7 @@ import zipfile
 from dataclasses import dataclass
 from pathlib import Path
 from random import Random
-from typing import Final
+from typing import TYPE_CHECKING, Final
 
 import pytest
 
@@ -39,7 +39,9 @@ from nexus_orchestrator.verification_plane.checkers import (
     CommandResult,
     CommandSpec,
     DocumentationChecker,
+    JSONValue,
     LintChecker,
+    LocalSubprocessExecutor,
     PerformanceChecker,
     ReliabilityChecker,
     SchemaChecker,
@@ -48,6 +50,7 @@ from nexus_orchestrator.verification_plane.checkers import (
     TypecheckChecker,
     Violation,
     normalize_artifact_paths,
+    normalize_command_lines,
     normalize_violations,
 )
 from nexus_orchestrator.verification_plane.checkers import (
@@ -58,6 +61,9 @@ from nexus_orchestrator.verification_plane.evidence import (
     export_audit_bundle,
     verify_integrity,
 )
+
+if TYPE_CHECKING:
+    from nexus_orchestrator.verification_plane.checkers.scope_checker import ChangedPath
 
 
 @dataclass(frozen=True, slots=True)
@@ -113,7 +119,7 @@ class TimeoutScopeProvider:
         *,
         context: CheckerContext,
         timeout_seconds: float,
-    ) -> tuple[object, ...]:
+    ) -> tuple[ChangedPath, ...]:
         _ = context
         _ = timeout_seconds
         raise TimeoutError("simulated timeout")
@@ -169,7 +175,7 @@ async def test_checkers_produce_required_fields_and_tool_versions(tmp_path: Path
     workspace = _seed_workspace(tmp_path)
     executor = FakeExecutor()
 
-    cases: tuple[tuple[str, object, dict[str, object], str], ...] = (
+    cases: tuple[tuple[str, object, dict[str, JSONValue], str], ...] = (
         (
             "build",
             BuildChecker(),
@@ -258,6 +264,7 @@ async def test_checkers_produce_required_fields_and_tool_versions(tmp_path: Path
         "tool_versions",
         "artifact_paths",
         "logs_path",
+        "command_lines",
         "duration_ms",
         "metadata",
         "checker_id",
@@ -275,6 +282,7 @@ async def test_checkers_produce_required_fields_and_tool_versions(tmp_path: Path
         payload = result.to_dict()
         assert required_fields.issubset(payload.keys())
         assert expected_tool in result.tool_versions
+        assert result.command_lines == normalize_command_lines(result.command_lines)
         assert tuple(sorted(result.artifact_paths)) == result.artifact_paths
         assert (
             tuple(sorted(result.violations, key=lambda item: item.sort_key())) == result.violations
@@ -376,6 +384,33 @@ async def test_timeout_behavior_is_uniform_and_deterministic(tmp_path: Path) -> 
     assert reliability_result.status is CheckStatus.TIMEOUT
 
 
+@pytest.mark.asyncio
+async def test_security_dependency_audit_unavailable_fails_when_required(tmp_path: Path) -> None:
+    workspace = _seed_workspace(tmp_path)
+    executor = FakeExecutor(
+        responses={
+            ("pip-audit", "-f", "json"): FakeOutcome(
+                exit_code=None,
+                error="command not found",
+            )
+        }
+    )
+
+    result = await SecurityChecker().check(
+        CheckerContext(
+            workspace_path=str(workspace),
+            config={
+                "scan_type": "dependency_audit",
+                "constraint_ids": ["CON-SEC-0002"],
+            },
+            command_executor=executor,
+        )
+    )
+
+    assert result.status is CheckStatus.FAIL
+    assert any(item.code == "security.dependency_audit.unavailable" for item in result.violations)
+
+
 def test_violation_normalization_is_stable_under_deterministic_fuzz() -> None:
     rng = Random(20260212)
 
@@ -419,6 +454,236 @@ def test_artifact_path_normalization_is_stable_under_deterministic_fuzz() -> Non
 
         assert normalized_a == normalized_b
         assert normalized_a == tuple(sorted(set(normalized_a)))
+
+
+def test_command_line_normalization_is_stable_under_deterministic_fuzz() -> None:
+    rng = Random(11)
+    for _ in range(25):
+        base = [f"tool --arg {rng.randint(0, 8)}" for _inner in range(12)]
+        shuffled_a = list(base)
+        shuffled_b = list(base)
+        rng.shuffle(shuffled_a)
+        rng.shuffle(shuffled_b)
+
+        normalized_a = normalize_command_lines(shuffled_a)
+        normalized_b = normalize_command_lines(shuffled_b)
+
+        assert normalized_a == normalized_b
+        assert normalized_a == tuple(sorted(set(normalized_a)))
+
+
+@pytest.mark.asyncio
+async def test_performance_checker_skips_without_perf_constraints(tmp_path: Path) -> None:
+    workspace = _seed_workspace(tmp_path)
+    executor = FakeExecutor()
+
+    result = await PerformanceChecker().check(
+        CheckerContext(
+            workspace_path=str(workspace),
+            config={},
+            command_executor=executor,
+        )
+    )
+
+    assert result.status is CheckStatus.SKIP
+    assert result.metadata["reason"] == "no_performance_constraints"
+    assert executor.calls == []
+
+
+@pytest.mark.asyncio
+async def test_test_checker_coverage_threshold_and_incremental_mapping(tmp_path: Path) -> None:
+    workspace = _seed_workspace(tmp_path)
+    _write_text(
+        workspace / "tests" / "unit" / "verification_plane" / "test_pipeline.py",
+        "def test_pipeline_stub() -> None:\n    assert True\n",
+    )
+    executor = FakeExecutor()
+
+    coverage_result = await NexusTestChecker().check(
+        CheckerContext(
+            workspace_path=str(workspace),
+            config={
+                "test_type": "coverage",
+                "coverage_target": "src/nexus_orchestrator",
+                "min_coverage_percent": 87.5,
+                "constraint_ids": ["CON-COR-0003"],
+            },
+            command_executor=executor,
+        )
+    )
+    assert coverage_result.status is CheckStatus.PASS
+    coverage_argv = executor.calls[0].argv
+    assert "--cov-fail-under" in coverage_argv
+    threshold_index = coverage_argv.index("--cov-fail-under") + 1
+    assert coverage_argv[threshold_index] == "87.50"
+
+    executor.calls.clear()
+    incremental_result = await NexusTestChecker().check(
+        CheckerContext(
+            workspace_path=str(workspace),
+            config={
+                "test_type": "unit",
+                "mode": "incremental",
+                "changed_files": [
+                    "src/nexus_orchestrator/verification_plane/pipeline.py",
+                    "tests/unit/verification_plane/test_pipeline.py",
+                ],
+                "constraint_ids": ["CON-COR-0002"],
+            },
+            command_executor=executor,
+        )
+    )
+    assert incremental_result.status is CheckStatus.PASS
+    incremental_argv = executor.calls[0].argv
+    assert incremental_argv[0] == "pytest"
+    assert "tests/unit/verification_plane/test_pipeline.py" in incremental_argv
+    assert "tests/unit/test_pipeline.py" not in incremental_argv
+
+
+@pytest.mark.asyncio
+async def test_test_checker_incremental_mode_skips_nonexistent_and_deleted_tests(
+    tmp_path: Path,
+) -> None:
+    workspace = _seed_workspace(tmp_path)
+    _write_text(
+        workspace / "tests" / "unit" / "verification_plane" / "test_pipeline.py",
+        "def test_pipeline_stub() -> None:\n    assert True\n",
+    )
+    executor = FakeExecutor()
+
+    result = await NexusTestChecker().check(
+        CheckerContext(
+            workspace_path=str(workspace),
+            config={
+                "mode": "incremental",
+                "changed_files": [
+                    {"path": "tests/unit/verification_plane/test_pipeline.py", "kind": "modified"},
+                    {"path": "tests/unit/verification_plane/test_deleted.py", "kind": "deleted"},
+                    "src/nexus_orchestrator/verification_plane/pipeline.py",
+                ],
+            },
+            command_executor=executor,
+        )
+    )
+
+    assert result.status is CheckStatus.PASS
+    argv = executor.calls[0].argv
+    assert argv[0] == "pytest"
+    assert argv[1:-1] == ("tests/unit/verification_plane/test_pipeline.py",)
+    assert "tests/unit/verification_plane/test_deleted.py" not in argv
+    assert "tests/unit/test_pipeline.py" not in argv
+    assert "tests/test_pipeline.py" not in argv
+
+
+@pytest.mark.asyncio
+async def test_build_checker_incremental_mode_ignores_deleted_and_missing_changed_files(
+    tmp_path: Path,
+) -> None:
+    workspace = _seed_workspace(tmp_path)
+    _write_text(workspace / "src" / "existing.py", "def existing() -> int:\n    return 1\n")
+    executor = FakeExecutor()
+
+    result = await BuildChecker().check(
+        CheckerContext(
+            workspace_path=str(workspace),
+            config={
+                "mode": "incremental",
+                "changed_files": [
+                    {"path": "src/existing.py", "kind": "modified"},
+                    {"path": "src/mod.py", "kind": "deleted"},
+                    {"path": "src/deleted.py", "kind": "deleted"},
+                    "src/missing.py",
+                ],
+            },
+            command_executor=executor,
+        )
+    )
+
+    assert result.status is CheckStatus.PASS
+    argv = executor.calls[0].argv
+    assert argv[:3] == ("python", "-m", "py_compile")
+    assert "src/existing.py" in argv
+    assert "src/mod.py" not in argv
+    assert "src/deleted.py" not in argv
+    assert "src/missing.py" not in argv
+
+
+@pytest.mark.asyncio
+async def test_scope_checker_override_returns_warn(tmp_path: Path) -> None:
+    workspace = _seed_workspace(tmp_path)
+    result = await ScopeChecker().check(
+        CheckerContext(
+            workspace_path=str(workspace),
+            config={
+                "changed_files": [{"path": "src/other.py", "kind": "modified"}],
+                "explicit_files": ["src/mod.py"],
+                "constraint_ids": ["CON-ARC-0001"],
+                "override": {
+                    "approved": True,
+                    "justification": "approved emergency fix",
+                    "approved_by": "release-manager",
+                },
+            },
+            command_executor=FakeExecutor(),
+        )
+    )
+    assert result.status is CheckStatus.WARN
+    assert any(item.code == "scope.override_applied" for item in result.violations)
+
+
+@pytest.mark.asyncio
+async def test_scope_checker_missing_head_returns_explicit_invariant_error(tmp_path: Path) -> None:
+    workspace = _seed_workspace(tmp_path)
+    executor = FakeExecutor(
+        responses={
+            (
+                "git",
+                "-c",
+                "core.quotepath=off",
+                "diff",
+                "--name-status",
+                "--find-renames",
+                "--diff-filter=ACDMRTUXB",
+                "--relative",
+                "HEAD",
+            ): FakeOutcome(
+                exit_code=128,
+                stderr="fatal: ambiguous argument 'HEAD': unknown revision or path not in the working tree",
+            )
+        }
+    )
+
+    result = await ScopeChecker().check(
+        CheckerContext(
+            workspace_path=str(workspace),
+            config={},
+            command_executor=executor,
+        )
+    )
+
+    assert result.status is CheckStatus.ERROR
+    assert any(
+        item.code == "scope.change_provider_error" and "HEAD is unavailable" in item.message
+        for item in result.violations
+    )
+
+
+@pytest.mark.asyncio
+async def test_local_subprocess_executor_enforces_timeout(tmp_path: Path) -> None:
+    workspace = _seed_workspace(tmp_path)
+    result = await BuildChecker().check(
+        CheckerContext(
+            workspace_path=str(workspace),
+            config={
+                "command": ["python", "-c", "import time; time.sleep(0.2)"],
+                "constraint_ids": ["CON-COR-0001"],
+                "timeout_seconds": 0.05,
+            },
+            command_executor=LocalSubprocessExecutor(default_timeout_seconds=1.0),
+        )
+    )
+    assert result.status is CheckStatus.TIMEOUT
+    assert any(item.code == "build_checker.timeout" for item in result.violations)
 
 
 def test_evidence_writer_integrity_and_audit_bundle(tmp_path: Path) -> None:

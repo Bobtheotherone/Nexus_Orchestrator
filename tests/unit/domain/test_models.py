@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from dataclasses import fields
+from dataclasses import fields, is_dataclass
 from datetime import datetime, timezone
 
 import pytest
@@ -24,7 +24,7 @@ def _utc_dt() -> datetime:
     return datetime(2026, 2, 1, 12, 0, 0, tzinfo=UTC)
 
 
-def _sample_objects() -> dict[str, object]:
+def _sample_objects() -> dict[str, models.CanonicalModel]:
     ts = _utc_dt()
     run_id = ids.generate_run_id(timestamp_ms=100, randbytes=_fixed_bytes)
     work_item_id = ids.generate_work_item_id(timestamp_ms=101, randbytes=_fixed_bytes)
@@ -199,7 +199,7 @@ def test_json_roundtrip_for_every_model() -> None:
     for model_name, instance in instances.items():
         cls = type(instance)
         assert hasattr(cls, "from_json"), f"{model_name} missing from_json"
-        json_payload = instance.to_json()  # type: ignore[attr-defined]
+        json_payload = instance.to_json()
         restored = cls.from_json(json_payload)
         assert restored == instance, model_name
 
@@ -286,8 +286,8 @@ def test_datetimes_must_be_timezone_aware_utc() -> None:
 
 def test_canonical_json_is_stable_and_sorted() -> None:
     evidence = _sample_objects()["EvidenceRecord"]
-    payload_1 = evidence.to_json()  # type: ignore[attr-defined]
-    payload_2 = evidence.to_json()  # type: ignore[attr-defined]
+    payload_1 = evidence.to_json()
+    payload_2 = evidence.to_json()
 
     assert payload_1 == payload_2
 
@@ -298,7 +298,7 @@ def test_canonical_json_is_stable_and_sorted() -> None:
 def test_evidence_record_rejects_large_inline_blob() -> None:
     sample = _sample_objects()
     evidence = sample["EvidenceRecord"]
-    evidence_dict = evidence.to_dict()  # type: ignore[attr-defined]
+    evidence_dict = evidence.to_dict()
     assert "raw_log" not in evidence_dict
 
     evidence_dict["metadata"] = {"raw_log": "x" * 3000}
@@ -308,7 +308,7 @@ def test_evidence_record_rejects_large_inline_blob() -> None:
 
 def test_model_from_dict_rejects_unknown_fields() -> None:
     requirement = _sample_objects()["Requirement"]
-    payload = requirement.to_dict()  # type: ignore[attr-defined]
+    payload = requirement.to_dict()
     payload["unknown"] = True
 
     with pytest.raises(ValueError, match=r"Requirement: unexpected fields"):
@@ -317,6 +317,7 @@ def test_model_from_dict_rejects_unknown_fields() -> None:
 
 def test_to_dict_contains_schema_version_field() -> None:
     for instance in _sample_objects().values():
-        if "schema_version" in {f.name for f in fields(type(instance))}:
-            payload = instance.to_dict()  # type: ignore[attr-defined]
+        assert is_dataclass(instance)
+        if "schema_version" in {f.name for f in fields(instance)}:
+            payload = instance.to_dict()
             assert payload["schema_version"] >= 1

@@ -18,7 +18,7 @@ from __future__ import annotations
 import re
 import shlex
 from collections.abc import Mapping, Sequence
-from pathlib import PurePosixPath
+from pathlib import Path, PurePosixPath
 from typing import Final
 
 from nexus_orchestrator.verification_plane.checkers.base import (
@@ -344,6 +344,7 @@ class CommandChecker(BaseChecker):
 
     async def check(self, context: CheckerContext) -> CheckResult:
         params = checker_parameters(context, self.checker_id)
+        params["__workspace_path"] = context.workspace_path
         covered_constraint_ids = extract_constraint_ids(
             context,
             params,
@@ -378,16 +379,20 @@ class CommandChecker(BaseChecker):
         probe_fingerprints = {
             (probe.exit_code, probe.timed_out, probe.error or "") for probe in probe_results
         }
+        resolved_version_command = _to_optional_command(
+            params.get("version_command"),
+            default=self.default_version_command,
+        )
         tool_version = await capture_tool_version(
             context=context,
             command=command,
             timeout_seconds=timeout_seconds,
-            version_command=_to_optional_command(
-                params.get("version_command"),
-                default=self.default_version_command,
-            ),
+            version_command=resolved_version_command,
         )
         tool_versions = {self.tool_name: tool_version}
+        command_lines = [" ".join(command)]
+        if resolved_version_command is not None:
+            command_lines.append(" ".join(resolved_version_command))
 
         status: CheckStatus
         violations: tuple[Violation, ...]
@@ -430,6 +435,7 @@ class CommandChecker(BaseChecker):
 
         metadata: dict[str, JSONValue] = {
             "command": list(command),
+            "command_lines": [line for line in command_lines],
             "allowed_exit_codes": list(allowed_exit_codes),
             "probe_runs": probe_runs,
             "probe_results": [
@@ -451,6 +457,7 @@ class CommandChecker(BaseChecker):
             tool_versions=tool_versions,
             artifact_paths=_artifact_paths_from_params(params),
             logs_path=_logs_path_from_params(params),
+            command_lines=tuple(command_lines),
             duration_ms=result.duration_ms,
             metadata=metadata,
             checker_id=self.checker_id,
@@ -470,6 +477,23 @@ class BuildChecker(CommandChecker):
     default_command = ("python", "-m", "compileall", "-q", "src")
     default_version_command = ("python", "--version")
     default_timeout_seconds = 120.0
+
+    def build_command(self, params: Mapping[str, object]) -> tuple[str, ...]:
+        command = params.get("command")
+        if command is not None:
+            return super().build_command(params)
+
+        mode_raw = params.get("mode")
+        mode = mode_raw.strip().lower() if isinstance(mode_raw, str) else "full"
+        if mode == "incremental":
+            changed = _collect_changed_python_files(
+                params.get("changed_files"),
+                workspace_root=_workspace_root_from_params(params),
+            )
+            if changed:
+                return ("python", "-m", "py_compile", *changed)
+
+        return self.default_command
 
     def parse_failures(
         self,
@@ -509,6 +533,54 @@ class BuildChecker(CommandChecker):
             findings[(item.code, item.path or "", item.line, item.column, item.message)] = item
 
         return tuple(sorted(findings.values(), key=lambda item: item.sort_key()))
+
+
+def _workspace_root_from_params(params: Mapping[str, object]) -> Path | None:
+    raw_workspace_path = params.get("__workspace_path")
+    if isinstance(raw_workspace_path, str) and raw_workspace_path.strip():
+        return Path(raw_workspace_path).resolve(strict=False)
+    return None
+
+
+def _collect_changed_python_files(
+    raw: object,
+    *,
+    workspace_root: Path | None = None,
+) -> tuple[str, ...]:
+    changed: set[str] = set()
+    if isinstance(raw, str):
+        raw_items: Sequence[object] = (raw,)
+    elif isinstance(raw, Sequence) and not isinstance(raw, (str, bytes, bytearray)):
+        raw_items = raw
+    else:
+        raw_items = ()
+
+    for item in raw_items:
+        candidate: str | None = None
+        deleted_change = False
+        if isinstance(item, str):
+            candidate = item
+        elif isinstance(item, Mapping):
+            maybe_path = item.get("path")
+            if isinstance(maybe_path, str):
+                candidate = maybe_path
+            raw_kind = item.get("kind")
+            if isinstance(raw_kind, str) and raw_kind.strip().lower() == "deleted":
+                deleted_change = True
+        if candidate is None:
+            continue
+        if deleted_change:
+            continue
+        normalized = _normalize_relative_path(candidate)
+        if normalized is None or not normalized.endswith(".py"):
+            continue
+        if workspace_root is not None:
+            resolved_path = (workspace_root / normalized).resolve(strict=False)
+            if not resolved_path.is_file():
+                continue
+        changed.add(normalized)
+
+    return tuple(sorted(changed))
 
 
 __all__ = [

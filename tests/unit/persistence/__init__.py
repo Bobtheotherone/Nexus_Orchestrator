@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import re
 from datetime import datetime, timedelta, timezone
-from typing import Final
+from typing import TYPE_CHECKING, Final, Protocol, cast
 
 from nexus_orchestrator.domain import ids
 from nexus_orchestrator.domain.models import (
@@ -19,6 +19,7 @@ from nexus_orchestrator.domain.models import (
     EvidenceRecord,
     EvidenceResult,
     Incident,
+    JSONValue,
     MergeRecord,
     RiskTier,
     Run,
@@ -28,6 +29,9 @@ from nexus_orchestrator.domain.models import (
     WorkItem,
     WorkItemStatus,
 )
+
+if TYPE_CHECKING:
+    from collections.abc import Callable, Mapping, Sequence
 
 try:
     from datetime import UTC
@@ -39,11 +43,19 @@ _BASE_TS: Final[datetime] = datetime(2026, 2, 1, 12, 0, 0, tzinfo=UTC)
 _IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
+class _CursorLike(Protocol):
+    def fetchall(self) -> Sequence[Sequence[object]]: ...
+
+
+class _ConnectionLike(Protocol):
+    def execute(self, statement: str) -> _CursorLike: ...
+
+
 def fixed_now(seed: int) -> datetime:
     return _BASE_TS + timedelta(seconds=seed)
 
 
-def _randbytes(seed: int):
+def _randbytes(seed: int) -> Callable[[int], bytes]:
     byte_value = (seed % 251) + 1
 
     def _provider(size: int) -> bytes:
@@ -80,7 +92,7 @@ def make_sandbox_policy() -> SandboxPolicy:
 def make_constraint(
     seed: int,
     *,
-    parameters: dict[str, object] | None = None,
+    parameters: Mapping[str, JSONValue] | None = None,
     requirement_links: tuple[str, ...] = ("REQ-0001",),
 ) -> Constraint:
     return Constraint(
@@ -89,7 +101,7 @@ def make_constraint(
         category="security",
         description="Constraint for persistence testing",
         checker_binding="security_checker",
-        parameters={} if parameters is None else parameters,
+        parameters={} if parameters is None else dict(parameters),
         requirement_links=requirement_links,
         source=ConstraintSource.MANUAL,
         created_at=fixed_now(seed),
@@ -102,7 +114,7 @@ def make_work_item(
     dependencies: tuple[str, ...] = (),
     status: WorkItemStatus = WorkItemStatus.READY,
     risk_tier: RiskTier = RiskTier.MEDIUM,
-    constraint_parameters: dict[str, object] | None = None,
+    constraint_parameters: Mapping[str, JSONValue] | None = None,
 ) -> WorkItem:
     work_item_id = ids.generate_work_item_id(
         timestamp_ms=1_700_000_000_000 + seed,
@@ -142,7 +154,7 @@ def make_run(
     *,
     status: RunStatus = RunStatus.RUNNING,
     work_item_ids: tuple[str, ...] = (),
-    metadata: dict[str, object] | None = None,
+    metadata: Mapping[str, JSONValue] | None = None,
 ) -> Run:
     return Run(
         id=ids.generate_run_id(
@@ -156,7 +168,7 @@ def make_run(
         work_item_ids=work_item_ids,
         budget=make_budget(seed),
         risk_tier=RiskTier.MEDIUM,
-        metadata={} if metadata is None else metadata,
+        metadata={} if metadata is None else dict(metadata),
     )
 
 
@@ -187,7 +199,7 @@ def make_evidence(
     run_id: str,
     work_item_id: str,
     constraint_ids: tuple[str, ...] = ("CON-SEC-0001",),
-    metadata: dict[str, object] | None = None,
+    metadata: Mapping[str, JSONValue] | None = None,
 ) -> EvidenceRecord:
     return EvidenceRecord(
         id=ids.generate_evidence_id(
@@ -206,7 +218,7 @@ def make_evidence(
         duration_ms=123,
         created_at=fixed_now(seed),
         summary="verification passed",
-        metadata={} if metadata is None else metadata,
+        metadata={} if metadata is None else dict(metadata),
     )
 
 
@@ -258,8 +270,9 @@ def make_task_graph(
 def collect_text_cells(conn: object) -> str:
     if not hasattr(conn, "execute"):
         raise TypeError("conn must expose execute()")
+    typed_conn = cast("_ConnectionLike", conn)
 
-    cursor = conn.execute(  # type: ignore[call-arg]
+    cursor = typed_conn.execute(
         """
         SELECT name
         FROM sqlite_master
@@ -273,7 +286,7 @@ def collect_text_cells(conn: object) -> str:
     for table_name in table_names:
         if not _IDENTIFIER_RE.fullmatch(table_name):
             continue
-        rows = conn.execute(f"SELECT * FROM {table_name}").fetchall()  # type: ignore[call-arg]
+        rows = typed_conn.execute(f"SELECT * FROM {table_name}").fetchall()
         for row in rows:
             for value in row:
                 if isinstance(value, str):

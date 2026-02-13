@@ -80,3 +80,24 @@ nexus export              # Produce audit bundle
 - **API rate limits:** Reduce `max_concurrent` for the affected provider
 - **Disk full:** Run `make clean` or reduce evidence retention
 - **Stuck work item:** Check `nexus inspect <id>` for feedback; may need manual constraint override
+
+## Phase 4 Audit Snippet (Pipefail Safe)
+
+Use this pattern when `set -euo pipefail` is enabled and `rg` returning exit code `1` means
+"no matches" (not a command failure):
+
+```bash
+set -euo pipefail
+
+# Fail only when the producer command fails; tolerate 'no matches' from rg.
+git log --format='%H%n%B%n---' -n 20 \
+  | rg 'NEXUS-(WorkItem|Evidence|Agent|Iteration):' \
+  || { code=$?; [ "$code" -eq 1 ] && echo "no trailer matches"; exit 0; }
+
+# Placeholder scan that does not fail when there are zero matches.
+rg -n --pcre2 'TODO|FIXME|NotImplementedError|^[[:space:]]*pass[[:space:]]*$' \
+  src/nexus_orchestrator/integration_plane \
+  tests/unit/integration_plane \
+  tests/integration/test_workspace_lifecycle.py \
+  || { code=$?; [ "$code" -eq 1 ] && echo "no placeholders found"; exit 0; }
+```

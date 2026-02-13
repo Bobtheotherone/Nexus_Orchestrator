@@ -11,6 +11,8 @@ Purpose
 
 Storage layout
 - `<evidence_root>/<run_id>/<work_item_id>/<stage>/<evidence_id>/`
+- `<evidence_root>/<run_id>/<work_item_id>/<attempt_id>/<stage>/<evidence_id>/` (optional attempt segment)
+  - `result.json` (redacted normalized checker result payload)
   - `metadata.json` (redacted, deterministic key ordering)
   - `logs/` (redacted log text)
   - `artifacts/` (inline or copied artifacts; copied text is redacted)
@@ -45,6 +47,7 @@ JSONScalar: TypeAlias = str | int | float | bool | None
 JSONValue: TypeAlias = JSONScalar | list["JSONValue"] | dict[str, "JSONValue"]
 
 _METADATA_FILE_NAME: Final[str] = "metadata.json"
+_RESULT_FILE_NAME: Final[str] = "result.json"
 _MANIFEST_FILE_NAME: Final[str] = "manifest.json"
 _LOGS_DIR: Final[PurePosixPath] = PurePosixPath("logs")
 _ARTIFACTS_DIR: Final[PurePosixPath] = PurePosixPath("artifacts")
@@ -137,6 +140,7 @@ class EvidenceWriter:
         *,
         run_id: str,
         work_item_id: str,
+        attempt_id: str | None = None,
         stage: str,
         evidence_id: str,
     ) -> Path:
@@ -144,10 +148,28 @@ class EvidenceWriter:
 
         run_segment = _normalize_path_segment(run_id, label="run_id")
         work_item_segment = _normalize_path_segment(work_item_id, label="work_item_id")
+        attempt_segment = (
+            _normalize_path_segment(attempt_id, label="attempt_id")
+            if attempt_id is not None
+            else None
+        )
         stage_segment = _normalize_path_segment(stage, label="stage")
         evidence_segment = _normalize_path_segment(evidence_id, label="evidence_id")
+        if attempt_segment is None:
+            return (
+                self._evidence_root
+                / run_segment
+                / work_item_segment
+                / stage_segment
+                / evidence_segment
+            )
         return (
-            self._evidence_root / run_segment / work_item_segment / stage_segment / evidence_segment
+            self._evidence_root
+            / run_segment
+            / work_item_segment
+            / attempt_segment
+            / stage_segment
+            / evidence_segment
         )
 
     def write_evidence(
@@ -155,8 +177,10 @@ class EvidenceWriter:
         *,
         run_id: str,
         work_item_id: str,
+        attempt_id: str | None = None,
         stage: str,
         evidence_id: str | None = None,
+        result: Mapping[str, object] | None = None,
         metadata: Mapping[str, object] | None = None,
         logs: Mapping[str, str] | None = None,
         artifacts: Mapping[str, object] | None = None,
@@ -182,6 +206,7 @@ class EvidenceWriter:
         evidence_dir = self.evidence_dir_for(
             run_id=run_id,
             work_item_id=work_item_id,
+            attempt_id=attempt_id,
             stage=stage,
             evidence_id=resolved_evidence_id,
         )
@@ -196,6 +221,8 @@ class EvidenceWriter:
             metadata_payload.update(metadata)
         metadata_payload.setdefault("run_id", run_id)
         metadata_payload.setdefault("work_item_id", work_item_id)
+        if attempt_id is not None:
+            metadata_payload.setdefault("attempt_id", attempt_id)
         metadata_payload.setdefault("stage", stage)
         metadata_payload.setdefault("evidence_id", resolved_evidence_id)
 
@@ -210,6 +237,15 @@ class EvidenceWriter:
         _write_json_file(metadata_path, metadata_json)
 
         written_rel_paths: set[str] = {_METADATA_FILE_NAME}
+
+        if result is not None:
+            result_json = _redact_json_value(
+                _to_json_value(result),
+                redaction_config=self._redaction_config,
+            )
+            result_path = evidence_dir / _RESULT_FILE_NAME
+            _write_json_file(result_path, result_json)
+            written_rel_paths.add(_RESULT_FILE_NAME)
 
         if logs is not None:
             for log_name, log_text in _sorted_mapping_items(logs, field_name="logs"):

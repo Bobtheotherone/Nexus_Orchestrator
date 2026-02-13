@@ -32,6 +32,7 @@ import subprocess
 import sys
 from collections import Counter
 from pathlib import Path
+from typing import Any, Protocol, cast
 
 import pytest
 from hypothesis import given, settings
@@ -41,17 +42,43 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 SRC_PATH = REPO_ROOT / "src"
 
 
-def _load_repo_blueprint_module() -> object:
+class _HeaderExtraction(Protocol):
+    header_present: bool
+    header_style: str | None
+    raw_header: str
+    file_purpose: tuple[str, ...]
+    referenced_modules_or_files: tuple[str, ...]
+
+
+class _RepoBlueprintModule(Protocol):
+    def _filesystem_fallback_paths(self, repo_root: Path) -> list[str]: ...
+    def _normalize_repo_path(self, token: str) -> str: ...
+    def build_repo_blueprint(self, repo_root: Path) -> dict[str, Any]: ...
+    def discover_tracked_files(self, repo_root: Path) -> tuple[list[str], str]: ...
+    def extract_header_metadata(self, repo_root: Path, rel_path: str) -> _HeaderExtraction: ...
+    def extract_header_metadata_from_text(self, path: str, text: str) -> _HeaderExtraction: ...
+    def scan_placeholders_in_paths(
+        self,
+        repo_root: Path,
+        rel_paths: list[str],
+        protected_paths: set[str],
+    ) -> dict[str, Any]: ...
+    def validate_repo_blueprint(
+        self, blueprint: dict[str, Any], repo_root: Path
+    ) -> dict[str, list[str]]: ...
+
+
+def _load_repo_blueprint_module() -> _RepoBlueprintModule:
     try:
         import nexus_orchestrator.repo_blueprint as module
 
-        return module
+        return cast("_RepoBlueprintModule", module)
     except ModuleNotFoundError:
         if str(SRC_PATH) not in sys.path:
             sys.path.insert(0, str(SRC_PATH))
         import nexus_orchestrator.repo_blueprint as module
 
-        return module
+        return cast("_RepoBlueprintModule", module)
 
 
 _repo_blueprint_module = _load_repo_blueprint_module()

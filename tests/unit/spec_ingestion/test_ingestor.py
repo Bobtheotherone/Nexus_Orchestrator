@@ -12,7 +12,7 @@ from hypothesis import strategies as st
 
 from nexus_orchestrator.spec_ingestion import SpecIngestError, ingest_spec, serialize_spec_map
 from nexus_orchestrator.spec_ingestion import ingestor as ingestor_module
-from nexus_orchestrator.spec_ingestion.spec_map import Requirement, SourceLocation, SpecMap
+from nexus_orchestrator.spec_ingestion.spec_map import Entity, Requirement, SourceLocation, SpecMap
 
 
 def _write_spec(tmp_path: Path, name: str, content: str) -> Path:
@@ -21,9 +21,9 @@ def _write_spec(tmp_path: Path, name: str, content: str) -> Path:
     return path
 
 
-def _find_requirement(spec_map: object, req_id: str) -> object:
-    for requirement in spec_map.requirements:  # type: ignore[attr-defined]
-        if requirement.id == req_id:  # type: ignore[attr-defined]
+def _find_requirement(spec_map: SpecMap, req_id: str) -> Requirement:
+    for requirement in spec_map.requirements:
+        if requirement.id == req_id:
             return requirement
     raise AssertionError(f"Requirement not found: {req_id}")
 
@@ -213,7 +213,7 @@ def test_merge_policy_allows_acceptance_additions_but_not_statement_changes(tmp_
 
     parsed = ingest_spec(primary, additional_sources=[supplemental])
     req = _find_requirement(parsed, "REQ-MERGE-0001")
-    assert req.acceptance_criteria == (  # type: ignore[attr-defined]
+    assert req.acceptance_criteria == (
         "local criterion one",
         "local criterion two",
         "global criterion",
@@ -466,9 +466,7 @@ def test_entity_and_glossary_conflicts_raise_actionable_errors(tmp_path: Path) -
                 source=req_source,
             )
         },
-        entities={
-            "Term": ingestor_module.Entity(name="Term", description="same", source=entity_source)
-        },
+        entities={"Term": Entity(name="Term", description="same", source=entity_source)},
         glossary={"Term": "first meaning"},
     )
     parsed_b = ingestor_module._ParsedSource(
@@ -482,9 +480,7 @@ def test_entity_and_glossary_conflicts_raise_actionable_errors(tmp_path: Path) -
                 source=req_source,
             )
         },
-        entities={
-            "Term": ingestor_module.Entity(name="Term", description="same", source=entity_source)
-        },
+        entities={"Term": Entity(name="Term", description="same", source=entity_source)},
         glossary={"Term": "second meaning"},
     )
     with pytest.raises(SpecIngestError, match="Glossary conflict"):

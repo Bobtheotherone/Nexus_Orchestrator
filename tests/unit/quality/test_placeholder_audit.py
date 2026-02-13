@@ -29,8 +29,12 @@ import re
 import tempfile
 from pathlib import Path
 from random import Random
+from typing import TYPE_CHECKING
 
 from nexus_orchestrator.quality import placeholder_audit
+
+if TYPE_CHECKING:
+    import pytest
 
 try:
     from hypothesis import given, seed, settings
@@ -295,7 +299,9 @@ def test_text_and_json_output_include_required_audit_fields(tmp_path: Path) -> N
     )
 
 
-def test_cli_wires_string_marker_and_self_reference_flags(tmp_path: Path, monkeypatch) -> None:
+def test_cli_wires_string_marker_and_self_reference_flags(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     warning_root = tmp_path / "warning_repo"
     rel_path = "src/tooling/string_markers.py"
     _write(warning_root, rel_path, "PATTERN = 'TODO in string'\n")
