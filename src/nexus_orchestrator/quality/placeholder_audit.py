@@ -28,21 +28,26 @@ from __future__ import annotations
 
 import argparse
 import ast
+import fnmatch
 import io
 import json
 import os
 import re
 import sys
 import tokenize
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-from typing import TYPE_CHECKING
-
-if TYPE_CHECKING:
-    from collections.abc import Sequence
 
 DEFAULT_ROOTS: tuple[str, ...] = ("src", "scripts")
 DEFAULT_EXCLUDE: tuple[str, ...] = ("tests/meta",)
+DEFAULT_SEVERITY_BY_PATH: tuple[tuple[str, str], ...] = (
+    ("src/**", "ERROR"),
+    ("scripts/**", "ERROR"),
+    ("tests/**", "WARNING"),
+    ("docs/**", "WARNING"),
+    ("**", "WARNING"),
+)
 DEFAULT_SELF_REFERENCE_ALLOWLIST: tuple[str, ...] = (
     "src/nexus_orchestrator/quality/placeholder_audit.py",
     "src/nexus_orchestrator/repo_blueprint.py",
@@ -63,12 +68,27 @@ _ALWAYS_IGNORED_DIRS = frozenset(
 )
 
 _TODO_FIXME_RE = re.compile(r"\b(?:TODO|FIXME)\b", re.IGNORECASE)
-_STRING_PLACEHOLDER_RE = re.compile(r"\b(?:TODO|FIXME|NotImplementedError)\b", re.IGNORECASE)
-_DOCS_TESTS_PLACEHOLDER_RE = re.compile(
-    r"(?i)\b(?:TODO|FIXME|TBD|XXX|NotImplementedError)\b|^\s*(?:pass|\.\.\.)\s*(?:#.*)?$"
-)
+_STRING_PLACEHOLDER_RE = re.compile(r"\b(?:TODO|FIXME)\b", re.IGNORECASE)
+_NON_PY_COMMENT_PREFIXES: dict[str, tuple[str, ...]] = {
+    ".cfg": ("#", ";", "//"),
+    ".conf": ("#", ";", "//"),
+    ".env": ("#", ";"),
+    ".ini": ("#", ";"),
+    ".jsonc": ("//", "/*", "*"),
+    ".md": ("<!--", "#", "-", "*"),
+    ".rst": ("..",),
+    ".sh": ("#",),
+    ".toml": ("#",),
+    ".txt": ("#", ";"),
+    ".yaml": ("#",),
+    ".yml": ("#",),
+}
 
 _SEVERITY_ORDER = {"ERROR": 0, "WARNING": 1}
+_SEVERITY_PATTERN_DELIMITERS: tuple[str, ...] = ("=", ":")
+
+SeverityRule = tuple[str, str]
+SeverityByPathInput = Mapping[str, str] | Sequence[str] | Sequence[SeverityRule]
 
 
 @dataclass(frozen=True, slots=True)
@@ -204,10 +224,18 @@ class _LineContextRecord:
 
 
 class _AstAnalyzer:
-    def __init__(self, *, rel_path: str, lines: Sequence[str], context_radius: int) -> None:
+    def __init__(
+        self,
+        *,
+        rel_path: str,
+        lines: Sequence[str],
+        context_radius: int,
+        severity_by_path: Sequence[tuple[str, str]],
+    ) -> None:
         self._rel_path = rel_path
         self._lines = lines
         self._context_radius = context_radius
+        self._severity_by_path = severity_by_path
         self._protocol_class_names: set[str] = set()
         self.findings: list[Finding] = []
         self._line_context: dict[int, _LineContextRecord] = {}
@@ -484,9 +512,14 @@ class _AstAnalyzer:
         reason: str,
         state: _TraversalState,
     ) -> None:
+        effective_severity = _apply_path_severity_policy(
+            rel_path=self._rel_path,
+            base_severity=severity,
+            severity_by_path=self._severity_by_path,
+        )
         self.findings.append(
             _make_finding(
-                severity=severity,
+                severity=effective_severity,
                 kind=kind,
                 path=self._rel_path,
                 line=line,
@@ -535,6 +568,10 @@ def run_placeholder_audit(
     roots: Sequence[str] | None = None,
     exclude: Sequence[str] | None = None,
     show_context: int = 2,
+    include_docstrings: bool = False,
+    include_string_literals: bool = False,
+    scan_tests_as_blocking: bool = False,
+    severity_by_path: SeverityByPathInput | None = None,
     warn_on_string_markers: bool = False,
     warn_on_audit_tool_self_references: bool = False,
     self_reference_allowlist: tuple[str, ...] = DEFAULT_SELF_REFERENCE_ALLOWLIST,
@@ -543,7 +580,12 @@ def run_placeholder_audit(
     normalized_roots = _normalize_inputs(DEFAULT_ROOTS if roots is None else roots)
     normalized_exclude = _normalize_inputs(DEFAULT_EXCLUDE if exclude is None else exclude)
     normalized_self_reference_allowlist = _normalize_inputs(self_reference_allowlist)
+    normalized_severity_by_path = _normalize_severity_by_path(
+        DEFAULT_SEVERITY_BY_PATH if severity_by_path is None else severity_by_path,
+        scan_tests_as_blocking=scan_tests_as_blocking,
+    )
     context_radius = max(show_context, 0)
+    include_string_literals_effective = include_string_literals or warn_on_string_markers
 
     files = _collect_files(root, roots=normalized_roots, exclude=normalized_exclude)
 
@@ -565,21 +607,23 @@ def run_placeholder_audit(
                     text=text,
                     lines=lines,
                     context_radius=context_radius,
-                    warn_on_string_markers=warn_on_string_markers,
+                    include_docstrings=include_docstrings,
+                    include_string_literals=include_string_literals_effective,
+                    severity_by_path=normalized_severity_by_path,
                     warn_on_audit_tool_self_references=warn_on_audit_tool_self_references,
                     self_reference_allowlist=normalized_self_reference_allowlist,
                 )
             )
             continue
 
-        if _is_docs_or_tests_path(rel_path):
-            findings.extend(
-                _scan_docs_tests_file(
-                    rel_path=rel_path,
-                    lines=lines,
-                    context_radius=context_radius,
-                )
+        findings.extend(
+            _scan_non_python_file(
+                rel_path=rel_path,
+                lines=lines,
+                context_radius=context_radius,
+                severity_by_path=normalized_severity_by_path,
             )
+        )
 
     deduped: dict[tuple[str, str, str, int, int, str, str], Finding] = {}
     for finding in findings:
@@ -630,6 +674,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             roots=args.roots,
             exclude=args.exclude,
             show_context=args.show_context,
+            include_docstrings=args.include_docstrings,
+            include_string_literals=args.include_string_literals,
+            scan_tests_as_blocking=args.scan_tests_as_blocking,
+            severity_by_path=args.severity_by_path,
             warn_on_string_markers=args.warn_on_string_markers,
             warn_on_audit_tool_self_references=args.warn_on_audit_tool_self_references,
             self_reference_allowlist=tuple(args.self_reference_allowlist),
@@ -685,9 +733,39 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Context lines before/after each finding.",
     )
     parser.add_argument(
+        "--include-string-literals",
+        action="store_true",
+        help="Include TODO/FIXME markers found in string literals (non-blocking by default).",
+    )
+    parser.add_argument(
+        "--include-docstrings",
+        action="store_true",
+        help=(
+            "When string-literal scanning is enabled, include docstring literals in marker checks."
+        ),
+    )
+    parser.add_argument(
+        "--scan-tests-as-blocking",
+        action="store_true",
+        help="Do not demote tests/** blocking findings to WARNING in path-severity policy.",
+    )
+    parser.add_argument(
+        "--severity-by-path",
+        action="append",
+        default=None,
+        metavar="GLOB=SEVERITY",
+        help=(
+            "Path-severity rule (repeatable), e.g. src/**=ERROR tests/**=WARNING. "
+            "Order is first-match and defaults to src/scripts ERROR, tests/docs WARNING."
+        ),
+    )
+    parser.add_argument(
         "--warn-on-string-markers",
         action="store_true",
-        help="Emit WARNING findings for TODO/FIXME/NotImplementedError markers in string literals.",
+        help=(
+            "Compatibility alias for --include-string-literals; emits non-blocking string-marker"
+            " findings."
+        ),
     )
     parser.add_argument(
         "--warn-on-audit-tool-self-references",
@@ -715,7 +793,9 @@ def _scan_python_file(
     text: str,
     lines: Sequence[str],
     context_radius: int,
-    warn_on_string_markers: bool,
+    include_docstrings: bool,
+    include_string_literals: bool,
+    severity_by_path: Sequence[tuple[str, str]],
     warn_on_audit_tool_self_references: bool,
     self_reference_allowlist: tuple[str, ...],
 ) -> list[Finding]:
@@ -731,14 +811,21 @@ def _scan_python_file(
     }
 
     ast_findings: list[Finding] = []
+    docstring_starts: set[tuple[int, int]] = set()
     try:
         module = ast.parse(text)
     except SyntaxError:
         module = None
 
     if module is not None:
-        analyzer = _AstAnalyzer(rel_path=rel_path, lines=lines, context_radius=context_radius)
+        analyzer = _AstAnalyzer(
+            rel_path=rel_path,
+            lines=lines,
+            context_radius=context_radius,
+            severity_by_path=severity_by_path,
+        )
         ast_findings, line_context = analyzer.analyze(module)
+        docstring_starts = _collect_docstring_starts(module)
 
     token_findings = _scan_tokens(
         rel_path=rel_path,
@@ -746,9 +833,12 @@ def _scan_python_file(
         lines=lines,
         context_radius=context_radius,
         line_context=line_context,
-        warn_on_string_markers=warn_on_string_markers,
+        include_docstrings=include_docstrings,
+        include_string_literals=include_string_literals,
+        severity_by_path=severity_by_path,
         warn_on_audit_tool_self_references=warn_on_audit_tool_self_references,
         self_reference_allowlist=self_reference_allowlist,
+        docstring_starts=docstring_starts,
     )
     return ast_findings + token_findings
 
@@ -760,9 +850,12 @@ def _scan_tokens(
     lines: Sequence[str],
     context_radius: int,
     line_context: dict[int, AstContext],
-    warn_on_string_markers: bool,
+    include_docstrings: bool,
+    include_string_literals: bool,
+    severity_by_path: Sequence[tuple[str, str]],
     warn_on_audit_tool_self_references: bool,
     self_reference_allowlist: tuple[str, ...],
+    docstring_starts: set[tuple[int, int]],
 ) -> list[Finding]:
     findings: list[Finding] = []
 
@@ -774,11 +867,15 @@ def _scan_tokens(
             if token.type == tokenize.COMMENT:
                 if _TODO_FIXME_RE.search(token.string) is None:
                     continue
-                severity = "ERROR" if _is_src_or_scripts_path(rel_path) else "WARNING"
+                severity = _apply_path_severity_policy(
+                    rel_path=rel_path,
+                    base_severity="ERROR",
+                    severity_by_path=severity_by_path,
+                )
                 reason = (
-                    "TODO/FIXME comment in src/scripts path."
+                    "TODO/FIXME comment in blocking path."
                     if severity == "ERROR"
-                    else "TODO/FIXME comment outside src/scripts path."
+                    else "TODO/FIXME comment in non-blocking path."
                 )
                 findings.append(
                     _make_finding(
@@ -796,7 +893,9 @@ def _scan_tokens(
                 continue
 
             if token.type == tokenize.STRING:
-                if not warn_on_string_markers:
+                if not include_string_literals:
+                    continue
+                if _is_docstring_token(token.start, docstring_starts) and not include_docstrings:
                     continue
                 if _STRING_PLACEHOLDER_RE.search(token.string) is None:
                     continue
@@ -804,12 +903,16 @@ def _scan_tokens(
                     continue
                 findings.append(
                     _make_finding(
-                        severity="WARNING",
+                        severity=_apply_path_severity_policy(
+                            rel_path=rel_path,
+                            base_severity="WARNING",
+                            severity_by_path=severity_by_path,
+                        ),
                         kind="placeholder_string_literal",
                         path=rel_path,
                         line=line,
                         col=col + 1,
-                        reason="String literal contains TODO/FIXME/NotImplementedError marker.",
+                        reason="String literal contains TODO/FIXME marker.",
                         lines=lines,
                         context_radius=context_radius,
                         state=_context_for_line(line_context, line),
@@ -821,35 +924,45 @@ def _scan_tokens(
     return findings
 
 
-def _scan_docs_tests_file(
+def _scan_non_python_file(
     *,
     rel_path: str,
     lines: Sequence[str],
     context_radius: int,
+    severity_by_path: Sequence[SeverityRule],
 ) -> list[Finding]:
-    findings: list[Finding] = []
-    state = AstContext(
-        class_name=None,
-        function_name=None,
-        decorators=(),
-        in_type_checking=False,
-        in_protocol=False,
-    )
+    prefixes = _non_python_comment_prefixes(rel_path)
+    if not prefixes:
+        return []
 
+    findings: list[Finding] = []
     for line_no, line_text in enumerate(lines, start=1):
-        if _DOCS_TESTS_PLACEHOLDER_RE.search(line_text) is None:
+        if _TODO_FIXME_RE.search(line_text) is None:
             continue
+        if not _non_python_line_matches_comment_marker(line_text=line_text, prefixes=prefixes):
+            continue
+
         findings.append(
             _make_finding(
-                severity="WARNING",
-                kind="placeholder_docs_tests_token",
+                severity=_apply_path_severity_policy(
+                    rel_path=rel_path,
+                    base_severity="WARNING",
+                    severity_by_path=severity_by_path,
+                ),
+                kind="todo_fixme_non_python_comment",
                 path=rel_path,
                 line=line_no,
                 col=1,
-                reason="Placeholder-like token detected in docs/tests file.",
+                reason="TODO/FIXME comment-like marker in non-Python file.",
                 lines=lines,
                 context_radius=context_radius,
-                state=state,
+                state=AstContext(
+                    class_name=None,
+                    function_name=None,
+                    decorators=(),
+                    in_type_checking=False,
+                    in_protocol=False,
+                ),
             )
         )
 
@@ -1047,12 +1160,7 @@ def _strip_optional_docstring(statements: Sequence[ast.stmt]) -> Sequence[ast.st
     if not statements:
         return statements
 
-    first = statements[0]
-    if (
-        isinstance(first, ast.Expr)
-        and isinstance(first.value, ast.Constant)
-        and isinstance(first.value.value, str)
-    ):
+    if _leading_docstring_expression(statements) is not None:
         return statements[1:]
     return statements
 
@@ -1154,18 +1262,173 @@ def _is_type_checking_test(expression: ast.expr) -> bool:
     return False
 
 
-def _is_src_or_scripts_path(rel_path: str) -> bool:
-    parts = PurePosixPath(rel_path).parts
-    if not parts:
-        return False
-    return parts[0] in {"src", "scripts"}
-
-
 def _is_docs_or_tests_path(rel_path: str) -> bool:
     parts = PurePosixPath(rel_path).parts
     if not parts:
         return False
     return parts[0] in {"docs", "tests"}
+
+
+def _non_python_comment_prefixes(rel_path: str) -> tuple[str, ...]:
+    suffix = PurePosixPath(rel_path).suffix.lower()
+    if suffix in _NON_PY_COMMENT_PREFIXES:
+        return _NON_PY_COMMENT_PREFIXES[suffix]
+    if _is_docs_or_tests_path(rel_path):
+        return ("#", ";", "//", "<!--", "-", "*", "..")
+    return ()
+
+
+def _non_python_line_matches_comment_marker(*, line_text: str, prefixes: Sequence[str]) -> bool:
+    stripped = line_text.lstrip()
+    if not stripped:
+        return False
+    return any(stripped.startswith(prefix) for prefix in prefixes)
+
+
+def _collect_docstring_starts(module: ast.Module) -> set[tuple[int, int]]:
+    starts: set[tuple[int, int]] = set()
+    for node in ast.walk(module):
+        statements: Sequence[ast.stmt] | None = None
+        if isinstance(node, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+            statements = node.body
+
+        if statements is None:
+            continue
+
+        docstring_expr = _leading_docstring_expression(statements)
+        if docstring_expr is None:
+            continue
+        starts.add((docstring_expr.lineno, docstring_expr.col_offset))
+    return starts
+
+
+def _leading_docstring_expression(statements: Sequence[ast.stmt]) -> ast.Expr | None:
+    if not statements:
+        return None
+    first = statements[0]
+    if (
+        isinstance(first, ast.Expr)
+        and isinstance(first.value, ast.Constant)
+        and isinstance(first.value.value, str)
+    ):
+        return first
+    return None
+
+
+def _is_docstring_token(
+    token_start: tuple[int, int], docstring_starts: set[tuple[int, int]]
+) -> bool:
+    return token_start in docstring_starts
+
+
+def _normalize_severity_by_path(
+    raw_rules: SeverityByPathInput,
+    *,
+    scan_tests_as_blocking: bool,
+) -> tuple[SeverityRule, ...]:
+    normalized_rules: list[SeverityRule] = []
+
+    if isinstance(raw_rules, Mapping):
+        for pattern_raw, severity_raw in raw_rules.items():
+            normalized_rules.append(
+                (_normalize_glob_pattern(pattern_raw), _normalize_severity(severity_raw))
+            )
+    else:
+        for rule in raw_rules:
+            if isinstance(rule, str):
+                normalized_rules.append(_parse_severity_rule_spec(rule))
+                continue
+
+            if len(rule) != 2:
+                raise ValueError(
+                    "severity_by_path tuple entries must have exactly two items: (glob, severity)"
+                )
+            pattern_raw, severity_raw = rule
+            if not isinstance(pattern_raw, str) or not isinstance(severity_raw, str):
+                raise ValueError("severity_by_path tuple entries must be (str, str)")
+            normalized_rules.append(
+                (_normalize_glob_pattern(pattern_raw), _normalize_severity(severity_raw))
+            )
+
+    if scan_tests_as_blocking:
+        normalized_rules.insert(0, ("tests/**", "ERROR"))
+
+    if not normalized_rules:
+        normalized_rules = [*DEFAULT_SEVERITY_BY_PATH]
+    elif not any(pattern == "**" for pattern, _ in normalized_rules):
+        normalized_rules.append(("**", "WARNING"))
+
+    return tuple(normalized_rules)
+
+
+def _parse_severity_rule_spec(spec: str) -> SeverityRule:
+    raw = spec.strip()
+    if not raw:
+        raise ValueError("severity_by_path entries cannot be empty")
+
+    for delimiter in _SEVERITY_PATTERN_DELIMITERS:
+        if delimiter not in raw:
+            continue
+        pattern_raw, severity_raw = raw.split(delimiter, 1)
+        return _normalize_glob_pattern(pattern_raw), _normalize_severity(severity_raw)
+
+    parts = raw.split()
+    if len(parts) == 2:
+        pattern_raw, severity_raw = parts
+        return _normalize_glob_pattern(pattern_raw), _normalize_severity(severity_raw)
+
+    raise ValueError("severity_by_path entries must look like 'glob=SEVERITY' or 'glob SEVERITY'")
+
+
+def _normalize_glob_pattern(value: str) -> str:
+    normalized = _normalize_path(value)
+    if normalized in {"", "."}:
+        return "**"
+    return normalized
+
+
+def _normalize_severity(value: str) -> str:
+    severity = value.strip().upper()
+    if severity not in _SEVERITY_ORDER:
+        raise ValueError(f"unsupported severity '{value}'. Expected one of: ERROR, WARNING")
+    return severity
+
+
+def _severity_for_path(rel_path: str, severity_by_path: Sequence[SeverityRule]) -> str:
+    normalized_path = _normalize_path(rel_path)
+    for pattern, severity in severity_by_path:
+        if _path_matches_glob(normalized_path, pattern):
+            return severity
+    return "WARNING"
+
+
+def _path_matches_glob(rel_path: str, pattern: str) -> bool:
+    if pattern == "**":
+        return True
+
+    if not _contains_glob_magic(pattern):
+        if rel_path == pattern:
+            return True
+        return rel_path.startswith(f"{pattern}/")
+
+    return fnmatch.fnmatchcase(rel_path, pattern)
+
+
+def _contains_glob_magic(pattern: str) -> bool:
+    return any(symbol in pattern for symbol in ("*", "?", "["))
+
+
+def _apply_path_severity_policy(
+    *, rel_path: str, base_severity: str, severity_by_path: Sequence[SeverityRule]
+) -> str:
+    normalized_base = base_severity.strip().upper()
+    if normalized_base not in _SEVERITY_ORDER:
+        return normalized_base
+
+    path_severity = _severity_for_path(rel_path, severity_by_path)
+    if _SEVERITY_ORDER[path_severity] > _SEVERITY_ORDER[normalized_base]:
+        return path_severity
+    return normalized_base
 
 
 __all__ = [
@@ -1174,6 +1437,7 @@ __all__ = [
     "ContextLine",
     "DEFAULT_EXCLUDE",
     "DEFAULT_ROOTS",
+    "DEFAULT_SEVERITY_BY_PATH",
     "DEFAULT_SELF_REFERENCE_ALLOWLIST",
     "Finding",
     "format_json",
