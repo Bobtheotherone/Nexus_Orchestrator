@@ -17,3 +17,38 @@ Functional requirements
 Non-functional requirements
 - Must be deterministic; same input yields same SpecMap (modulo timestamps).
 """
+
+from nexus_orchestrator.spec_ingestion.ingestor import SpecIngestError, ingest_spec
+from nexus_orchestrator.spec_ingestion.spec_map import (
+    Entity,
+    EntityDiff,
+    InterfaceContract,
+    InterfaceDiff,
+    Requirement,
+    RequirementDiff,
+    SourceLocation,
+    SpecMap,
+    SpecMapDiff,
+    deserialize_spec_map,
+    diff_spec_maps,
+    serialize_spec_map,
+    trace_requirement_to_work_items,
+)
+
+__all__ = [
+    "Entity",
+    "EntityDiff",
+    "InterfaceContract",
+    "InterfaceDiff",
+    "Requirement",
+    "RequirementDiff",
+    "SourceLocation",
+    "SpecIngestError",
+    "SpecMap",
+    "SpecMapDiff",
+    "deserialize_spec_map",
+    "diff_spec_maps",
+    "ingest_spec",
+    "serialize_spec_map",
+    "trace_requirement_to_work_items",
+]
