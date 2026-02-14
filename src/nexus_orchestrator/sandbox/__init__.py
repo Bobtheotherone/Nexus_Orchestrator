@@ -1,18 +1,77 @@
-"""
-nexus-orchestrator — module skeleton
+"""Public sandbox subsystem exports."""
 
-File: src/nexus_orchestrator/sandbox/__init__.py
-Last updated: 2026-02-11
+from nexus_orchestrator.sandbox.network_policy import (
+    NetworkAccessEvent,
+    NetworkDecision,
+    NetworkPolicy,
+    NetworkPolicyMode,
+    NetworkPolicyViolation,
+)
+from nexus_orchestrator.sandbox.resource_governor import (
+    BackpressureLevel,
+    MetricsProvider,
+    ResourceDecision,
+    ResourceGovernor,
+    ResourceGovernorConfig,
+    ResourceLimits,
+    ResourceMetricsSnapshot,
+    SystemMetricsProvider,
+)
+from nexus_orchestrator.sandbox.sandbox_manager import (
+    SandboxBackend,
+    SandboxCommandResult,
+    SandboxError,
+    SandboxManager,
+    SandboxPolicyError,
+    UnsupportedSandboxBackendError,
+)
+from nexus_orchestrator.sandbox.tool_provisioner import (
+    CommandExecutionResult,
+    CommandRunner,
+    DownloadedReleaseArtifact,
+    GithubReleaseDownloader,
+    SubprocessCommandRunner,
+    ToolInstallCommandError,
+    ToolInstallRepository,
+    ToolProvisioner,
+    ToolProvisioningError,
+    ToolProvisioningResult,
+    ToolRegistryEntry,
+    ToolRegistryError,
+    load_tool_registry,
+)
 
-Purpose
-- Sandbox execution environment for tools, checkers, and agent-invoked commands.
-
-What should be included in this file
-- SandboxManager, ToolProvisioner, ResourceGovernor interfaces.
-
-Functional requirements
-- Must enforce filesystem scoping and resource limits.
-
-Non-functional requirements
-- Must be secure-by-default with configurable strictness.
-"""
+__all__ = [
+    "BackpressureLevel",
+    "CommandExecutionResult",
+    "CommandRunner",
+    "DownloadedReleaseArtifact",
+    "GithubReleaseDownloader",
+    "MetricsProvider",
+    "NetworkAccessEvent",
+    "NetworkDecision",
+    "NetworkPolicy",
+    "NetworkPolicyMode",
+    "NetworkPolicyViolation",
+    "ResourceDecision",
+    "ResourceGovernor",
+    "ResourceGovernorConfig",
+    "ResourceLimits",
+    "ResourceMetricsSnapshot",
+    "SandboxBackend",
+    "SandboxCommandResult",
+    "SandboxError",
+    "SandboxManager",
+    "SandboxPolicyError",
+    "SubprocessCommandRunner",
+    "SystemMetricsProvider",
+    "ToolInstallCommandError",
+    "ToolInstallRepository",
+    "ToolProvisioner",
+    "ToolProvisioningError",
+    "ToolProvisioningResult",
+    "ToolRegistryEntry",
+    "ToolRegistryError",
+    "UnsupportedSandboxBackendError",
+    "load_tool_registry",
+]

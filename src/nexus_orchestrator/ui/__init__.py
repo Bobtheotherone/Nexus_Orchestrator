@@ -1,18 +1,13 @@
-"""
-nexus-orchestrator — module skeleton
+"""UI package exports for CLI and optional TUI surfaces."""
 
-File: src/nexus_orchestrator/ui/__init__.py
-Last updated: 2026-02-11
+from nexus_orchestrator.ui.cli import build_parser, cli_entrypoint, main, run_cli
+from nexus_orchestrator.ui.tui import tui_available, tui_entrypoint
 
-Purpose
-- User interfaces: CLI and optional TUI/local web.
-
-What should be included in this file
-- Separation between UI layer and core logic (controller APIs).
-
-Functional requirements
-- Must expose commands: plan, run, status, inspect, export, clean.
-
-Non-functional requirements
-- Must remain usable over SSH/terminal; TUI optional.
-"""
+__all__ = [
+    "build_parser",
+    "cli_entrypoint",
+    "main",
+    "run_cli",
+    "tui_available",
+    "tui_entrypoint",
+]

@@ -20,6 +20,7 @@ _BRANCH_COMPONENT_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 _TRAILER_VALUE_RE = re.compile(r"^[A-Za-z0-9._/@,-]+$")
 _FORBIDDEN_SANITIZER_CHARS = (" ", "\t", "\r", "\n", ":")
 _WINDOWS_ABSOLUTE_PATH_RE = re.compile(r"^[A-Za-z]:[\\/]")
+_MISSING_INDEX_PATH_RE = re.compile(r"^error:\s+(?P<path>.+?):\s+does not exist in index$")
 
 
 class GitEngineError(RuntimeError):
@@ -239,11 +240,42 @@ class GitEngine:
 
         patch_text = unified_diff if unified_diff.endswith("\n") else f"{unified_diff}\n"
         self._validate_patch_paths(patch_text)
-        self._run_git(
-            ["apply", "--index", "--whitespace=nowarn", "-"],
-            cwd=Path(worktree_path),
-            input_text=patch_text,
-        )
+        worktree = Path(worktree_path)
+        command = ["apply", "--index", "--whitespace=nowarn", "-"]
+        try:
+            self._run_git(command, cwd=worktree, input_text=patch_text)
+            return
+        except GitCommandError as exc:
+            missing_paths = self._missing_index_paths_from_error(exc)
+            if not missing_paths:
+                if self._is_patch_already_applied(worktree, patch_text):
+                    return
+                raise
+
+            staged_any = False
+            worktree_root = worktree.resolve()
+            for rel_path in missing_paths:
+                candidate = (worktree_root / rel_path).resolve()
+                try:
+                    candidate.relative_to(worktree_root)
+                except ValueError:
+                    continue
+                if not candidate.exists() or candidate.is_dir():
+                    continue
+                self._run_git(["add", "--", rel_path], cwd=worktree_root)
+                staged_any = True
+
+            if not staged_any:
+                if self._is_patch_already_applied(worktree_root, patch_text):
+                    return
+                raise
+
+            try:
+                self._run_git(command, cwd=worktree_root, input_text=patch_text)
+            except GitCommandError:
+                if self._is_patch_already_applied(worktree_root, patch_text):
+                    return
+                raise
 
     def commit(
         self,
@@ -583,6 +615,28 @@ class GitEngine:
         while normalized.startswith("./"):
             normalized = normalized[2:]
         return normalized
+
+    def _missing_index_paths_from_error(self, error: GitCommandError) -> tuple[str, ...]:
+        paths: set[str] = set()
+        for line in error.stderr.splitlines():
+            match = _MISSING_INDEX_PATH_RE.match(line.strip())
+            if match is None:
+                continue
+            candidate = match.group("path").strip()
+            if candidate:
+                paths.add(candidate)
+        return tuple(sorted(paths))
+
+    def _is_patch_already_applied(self, worktree_path: Path, patch_text: str) -> bool:
+        try:
+            self._run_git(
+                ["apply", "--reverse", "--check", "--whitespace=nowarn", "-"],
+                cwd=worktree_path,
+                input_text=patch_text,
+            )
+        except GitCommandError:
+            return False
+        return True
 
     def _validate_patch_paths(self, unified_diff: str) -> None:
         for raw_path in self._extract_patch_paths(unified_diff):

@@ -1,22 +1,29 @@
-"""
-nexus-orchestrator — module skeleton
+"""Knowledge plane public API."""
 
-File: src/nexus_orchestrator/knowledge_plane/__init__.py
-Last updated: 2026-02-11
-
-Purpose
-- Knowledge plane: indexing, retrieval, constraint registry, evidence ledger access, personalization memory, and failure pattern mining.
-
-What should be included in this file
-- Interfaces to query codebase knowledge and historical runs.
-
-Functional requirements
-- Must serve context assembler and scheduler decisions.
-
-Non-functional requirements
-- Must be incremental and lightweight on a single machine.
-"""
-
+from nexus_orchestrator.knowledge_plane.constraint_registry import (
+    ConstraintExemptionRecord,
+    ConstraintExemptionTracker,
+    ConstraintRegistry,
+)
+from nexus_orchestrator.knowledge_plane.evidence_ledger import (
+    AuditBundleResult,
+    ConstraintEvidenceRow,
+    ConstraintFailureRow,
+    ConstraintTraceResult,
+    EvidenceIntegrityReport,
+    EvidenceIntegrityRow,
+    EvidenceLedger,
+    RequirementCoverageRow,
+    RequirementTraceResult,
+    RequirementTraceRow,
+    SpecCoverageReport,
+)
+from nexus_orchestrator.knowledge_plane.failure_mining import (
+    DEFAULT_MINER_VERSION,
+    ConstraintMiner,
+    ConstraintProposal,
+    FailureTaxonomy,
+)
 from nexus_orchestrator.knowledge_plane.indexer import (
     INDEX_SCHEMA_VERSION,
     AdapterParseError,
@@ -28,6 +35,15 @@ from nexus_orchestrator.knowledge_plane.indexer import (
     LanguageAdapter,
     PythonAstAdapter,
     RepositoryIndexer,
+)
+from nexus_orchestrator.knowledge_plane.personalization import (
+    DEFAULT_OPERATOR_PROFILE_PATH,
+    OperatorProfile,
+    OperatorProfileLoadError,
+    load_operator_profile,
+    planning_overlay_from_profile,
+    resolve_operator_profile_path,
+    routing_overlay_from_profile,
 )
 from nexus_orchestrator.knowledge_plane.retrieval import (
     ContextDoc,
@@ -44,6 +60,21 @@ from nexus_orchestrator.knowledge_plane.retrieval import (
 
 __all__ = [
     "AdapterParseError",
+    "AuditBundleResult",
+    "ConstraintEvidenceRow",
+    "ConstraintExemptionRecord",
+    "ConstraintExemptionTracker",
+    "ConstraintFailureRow",
+    "ConstraintMiner",
+    "ConstraintProposal",
+    "ConstraintRegistry",
+    "ConstraintTraceResult",
+    "DEFAULT_MINER_VERSION",
+    "DEFAULT_OPERATOR_PROFILE_PATH",
+    "EvidenceIntegrityReport",
+    "EvidenceIntegrityRow",
+    "EvidenceLedger",
+    "FailureTaxonomy",
     "ContextDoc",
     "FileAnalysis",
     "GenericTextAdapter",
@@ -52,15 +83,25 @@ __all__ = [
     "IndexExcludes",
     "IndexerLoadError",
     "LanguageAdapter",
+    "OperatorProfile",
+    "OperatorProfileLoadError",
     "PythonAstAdapter",
+    "RequirementCoverageRow",
+    "RequirementTraceResult",
+    "RequirementTraceRow",
     "RepositoryIndexer",
     "RetrievalBundle",
     "RetrievalCandidate",
     "RetrievalTier",
+    "SpecCoverageReport",
     "TokenEstimator",
     "TruncationManifestEntry",
     "classify_candidate_tier",
     "estimate_tokens",
+    "load_operator_profile",
+    "planning_overlay_from_profile",
     "rank_candidates",
+    "resolve_operator_profile_path",
     "retrieve_context_docs",
+    "routing_overlay_from_profile",
 ]

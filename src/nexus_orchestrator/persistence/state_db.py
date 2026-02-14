@@ -32,7 +32,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Final, Literal, TypeAlias, TypeVar
+from typing import Final, Literal, Protocol, TypeAlias, TypeVar, overload
 
 from nexus_orchestrator.constants import RISK_TIERS, STATE_DB_SCHEMA_VERSION
 from nexus_orchestrator.domain.models import (
@@ -60,6 +60,39 @@ DEFAULT_BUSY_RETRY_LIMIT: Final[int] = 4
 DEFAULT_BUSY_RETRY_BACKOFF_MS: Final[int] = 25
 DEFAULT_ASYNC_BLOCKING_POLICY: Final[AsyncBlockingPolicy] = "allow"
 ASYNC_BLOCKING_POLICIES: Final[tuple[AsyncBlockingPolicy, ...]] = ("allow", "strict")
+
+
+class _StateDBClassConnect(Protocol):
+    def __call__(
+        self,
+        path: str | Path,
+        *,
+        busy_timeout_ms: int = DEFAULT_BUSY_TIMEOUT_MS,
+        busy_retry_limit: int = DEFAULT_BUSY_RETRY_LIMIT,
+        busy_retry_backoff_ms: int = DEFAULT_BUSY_RETRY_BACKOFF_MS,
+        async_blocking_policy: AsyncBlockingPolicy = DEFAULT_ASYNC_BLOCKING_POLICY,
+    ) -> StateDB: ...
+
+
+class _StateDBInstanceConnect(Protocol):
+    def __call__(self) -> sqlite3.Connection: ...
+
+
+class _StateDBConnectDescriptor:
+    @overload
+    def __get__(self, instance: None, owner: type[StateDB]) -> _StateDBClassConnect: ...
+
+    @overload
+    def __get__(self, instance: StateDB, owner: type[StateDB]) -> _StateDBInstanceConnect: ...
+
+    def __get__(
+        self,
+        instance: StateDB | None,
+        owner: type[StateDB],
+    ) -> _StateDBClassConnect | _StateDBInstanceConnect:
+        if instance is None:
+            return owner._connect_constructor
+        return instance._connect_connection
 
 
 def _sql_enum(values: Sequence[str]) -> str:
@@ -387,6 +420,8 @@ class StateDBAsyncPolicyError(StateDBError):
 class StateDB:
     """SQLite state DB manager with deterministic migrations and safe helpers."""
 
+    connect: _StateDBConnectDescriptor = _StateDBConnectDescriptor()
+
     def __init__(
         self,
         path: str | Path,
@@ -441,9 +476,77 @@ class StateDB:
             "or offload sync calls via asyncio.to_thread(...)"
         )
 
-    def connect(self) -> sqlite3.Connection:
+    @classmethod
+    def _connect_constructor(
+        cls,
+        path: str | Path,
+        *,
+        busy_timeout_ms: int = DEFAULT_BUSY_TIMEOUT_MS,
+        busy_retry_limit: int = DEFAULT_BUSY_RETRY_LIMIT,
+        busy_retry_backoff_ms: int = DEFAULT_BUSY_RETRY_BACKOFF_MS,
+        async_blocking_policy: AsyncBlockingPolicy = DEFAULT_ASYNC_BLOCKING_POLICY,
+    ) -> StateDB:
+        if isinstance(path, StateDB):
+            raise TypeError(
+                "StateDB.connect(db) is invalid; call db.connect() to open a sqlite3.Connection."
+            )
+        if not isinstance(path, (str, Path)):
+            raise TypeError(
+                "StateDB.connect(path, ...) expects `path` to be str or pathlib.Path; "
+                f"got {type(path).__name__}."
+            )
+        return cls(
+            path,
+            busy_timeout_ms=busy_timeout_ms,
+            busy_retry_limit=busy_retry_limit,
+            busy_retry_backoff_ms=busy_retry_backoff_ms,
+            async_blocking_policy=async_blocking_policy,
+        )
+
+    @classmethod
+    async def aconnect(
+        cls,
+        path: str | Path,
+        *,
+        busy_timeout_ms: int = DEFAULT_BUSY_TIMEOUT_MS,
+        busy_retry_limit: int = DEFAULT_BUSY_RETRY_LIMIT,
+        busy_retry_backoff_ms: int = DEFAULT_BUSY_RETRY_BACKOFF_MS,
+        async_blocking_policy: AsyncBlockingPolicy = DEFAULT_ASYNC_BLOCKING_POLICY,
+    ) -> StateDB:
+        return cls._connect_constructor(
+            path,
+            busy_timeout_ms=busy_timeout_ms,
+            busy_retry_limit=busy_retry_limit,
+            busy_retry_backoff_ms=busy_retry_backoff_ms,
+            async_blocking_policy=async_blocking_policy,
+        )
+
+    @classmethod
+    async def connect_async(
+        cls,
+        path: str | Path,
+        *,
+        busy_timeout_ms: int = DEFAULT_BUSY_TIMEOUT_MS,
+        busy_retry_limit: int = DEFAULT_BUSY_RETRY_LIMIT,
+        busy_retry_backoff_ms: int = DEFAULT_BUSY_RETRY_BACKOFF_MS,
+        async_blocking_policy: AsyncBlockingPolicy = DEFAULT_ASYNC_BLOCKING_POLICY,
+    ) -> StateDB:
+        return await cls.aconnect(
+            path,
+            busy_timeout_ms=busy_timeout_ms,
+            busy_retry_limit=busy_retry_limit,
+            busy_retry_backoff_ms=busy_retry_backoff_ms,
+            async_blocking_policy=async_blocking_policy,
+        )
+
+    def _connect_connection(self, *args: object, **kwargs: object) -> sqlite3.Connection:
         """Open a configured SQLite connection for the state DB."""
 
+        if args or kwargs:
+            raise TypeError(
+                "StateDB.connect() on an instance accepts no arguments; "
+                "use StateDB.connect(path, ...) to construct a StateDB."
+            )
         self._assert_sync_io_allowed(operation="connect")
         self._path.parent.mkdir(parents=True, exist_ok=True)
         conn = sqlite3.connect(
@@ -455,6 +558,15 @@ class StateDB:
         conn.row_factory = sqlite3.Row
         self._configure_connection(conn)
         return conn
+
+    def __await__(self) -> Iterator[object]:
+        async def _raise_await_misuse() -> None:
+            raise TypeError(
+                "StateDB is not awaitable. Use StateDB.connect(path, ...) for sync construction "
+                "or await StateDB.aconnect(path, ...) for async construction."
+            )
+
+        return _raise_await_misuse().__await__()
 
     @contextmanager
     def connection(self) -> Iterator[sqlite3.Connection]:

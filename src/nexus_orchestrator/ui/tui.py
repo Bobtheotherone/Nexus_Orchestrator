@@ -1,19 +1,32 @@
-"""
-nexus-orchestrator — module skeleton
+"""Optional TUI entrypoint with graceful fallback when dependencies are absent."""
 
-File: src/nexus_orchestrator/ui/tui.py
-Last updated: 2026-02-11
+from __future__ import annotations
 
-Purpose
-- Optional terminal UI (dashboard) for live monitoring: task graph status, queue, resource usage, costs.
+import sys
+from importlib.util import find_spec
 
-What should be included in this file
-- Layout plan and navigation (runs, work items, logs, evidence).
-- Event-driven updates from observability/events.
 
-Functional requirements
-- Must be optional; core system runs without it.
+def tui_available() -> bool:
+    """Return whether optional TUI dependencies are available in this environment."""
 
-Non-functional requirements
-- Must not consume excessive CPU/RAM.
-"""
+    return find_spec("textual") is not None
+
+
+def tui_entrypoint() -> int:
+    """Run optional TUI entrypoint or emit a deterministic fallback message."""
+
+    if not tui_available():
+        print(
+            "TUI unavailable: install optional dependencies (e.g. pip install .[tui]).",
+            file=sys.stderr,
+        )
+        return 2
+
+    print(
+        "TUI dependencies detected, but dashboard is not implemented in this build.",
+        file=sys.stderr,
+    )
+    return 2
+
+
+__all__ = ["tui_available", "tui_entrypoint"]
