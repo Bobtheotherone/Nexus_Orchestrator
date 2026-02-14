@@ -34,7 +34,7 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Final
 
-import yaml  # type: ignore[import-untyped]
+import yaml
 
 from nexus_orchestrator.config.schema import validate_config
 from nexus_orchestrator.verification_plane.checkers.base import (
