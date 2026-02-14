@@ -38,6 +38,7 @@ from nexus_orchestrator.integration_plane.merge_queue import (
 from nexus_orchestrator.integration_plane.merge_queue import (
     MergeResult as QueueMergeResult,
 )
+from nexus_orchestrator.persistence.state_db import StateDB
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
@@ -358,8 +359,19 @@ async def test_restart_safety_reconstructs_remaining_queue_without_duplication(
     assert first.candidate is not None
     assert first.candidate.work_item_id == "a"
 
-    persisted = json.loads(state_file.read_text(encoding="utf-8"))
-    pending_ids = [entry["work_item_id"] for entry in persisted["queue"]]
+    db = StateDB(queue1.state_db_path)
+    db.migrate()
+    persisted_row = db.query_one(
+        """
+        SELECT queue_json
+        FROM merge_queue_states
+        WHERE integration_branch = ?
+        """,
+        ("integration",),
+    )
+    assert persisted_row is not None
+    persisted_queue = json.loads(str(persisted_row["queue_json"]))
+    pending_ids = [entry["work_item_id"] for entry in persisted_queue]
     assert pending_ids == ["b", "c"]
 
     queue2 = MergeQueue(state_file)
@@ -377,6 +389,41 @@ async def test_restart_safety_reconstructs_remaining_queue_without_duplication(
     assert processed_after_restart == ["c", "b"]
     assert queue2.pending_candidates == ()
     assert queue2.completed_work_items == ("a", "b", "c")
+
+
+def test_legacy_json_import_runs_once_then_db_becomes_source_of_truth(tmp_path: Path) -> None:
+    state_file = tmp_path / "merge-queue.json"
+    legacy_payload = {
+        "schema_version": 1,
+        "next_arrival": 2,
+        "completed_work_items": ["a"],
+        "failed_work_items": [],
+        "queue": [_candidate("b", "work/b", risk=RiskTier.LOW).with_arrival(1).to_dict()],
+    }
+    state_file.write_text(json.dumps(legacy_payload), encoding="utf-8")
+
+    queue1 = MergeQueue(state_file)
+    assert [item.work_item_id for item in queue1.pending_candidates] == ["b"]
+    assert queue1.completed_work_items == ("a",)
+
+    db = StateDB(queue1.state_db_path)
+    db.migrate()
+    imported_row = db.query_one(
+        """
+        SELECT imported_from_legacy, legacy_state_path
+        FROM merge_queue_states
+        WHERE integration_branch = ?
+        """,
+        ("integration",),
+    )
+    assert imported_row is not None
+    assert int(imported_row["imported_from_legacy"]) == 1
+    assert str(imported_row["legacy_state_path"]) == str(state_file.resolve())
+
+    state_file.write_text('{"schema_version":1,', encoding="utf-8")
+    queue2 = MergeQueue(state_file)
+    assert [item.work_item_id for item in queue2.pending_candidates] == ["b"]
+    assert queue2.completed_work_items == ("a",)
 
 
 async def test_process_next_no_candidate_returns_no_candidate_and_records_hook(

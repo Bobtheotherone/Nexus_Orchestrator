@@ -35,15 +35,15 @@ default = "anthropic"  # "openai" | "anthropic" | "local"
 
 [providers.openai]
 api_key_env = "NEXUS_OPENAI_API_KEY"
-# model_code = "gpt-4.1"         # default model for Codex-class tasks
-# model_architect = "o3"          # model for architect role
+model_code = "gpt-5-codex"      # default model for implementation-class tasks
+model_architect = "gpt-5"       # default model for architect/reviewer escalation
 # max_concurrent = 20             # concurrent API sessions
 # requests_per_minute = 60
 
 [providers.anthropic]
 api_key_env = "NEXUS_ANTHROPIC_API_KEY"
-# model_code = "claude-sonnet-4-5-20250929"
-# model_architect = "claude-opus-4-6"
+model_code = "claude-sonnet-4-5"
+model_architect = "claude-opus-4-6"
 # max_concurrent = 10
 # requests_per_minute = 30
 

@@ -30,7 +30,9 @@ from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, Any, Protocol, TypeAlias
 
+from nexus_orchestrator.security.prompt_hygiene import DEFAULT_POLICY_MODE, sanitize_context
 from nexus_orchestrator.security.redaction import redact_text
+from nexus_orchestrator.synthesis_plane.prompt_templates import PromptTemplateEngine
 from nexus_orchestrator.utils.hashing import sha256_text
 
 if TYPE_CHECKING:
@@ -46,9 +48,12 @@ if TYPE_CHECKING:
 JSONScalar: TypeAlias = str | int | float | bool | None
 JSONValue: TypeAlias = JSONScalar | list["JSONValue"] | dict[str, "JSONValue"]
 
-_SUSPICIOUS_INSTRUCTION_RE = re.compile(
-    r"(?is)\b(ignore\s+previous|system\s+prompt|developer\s+message|"
-    r"exfiltrat|reveal\s+secrets?|prompt\s+injection|do\s+not\s+obey)\b"
+_TEMPLATE_RENDER_VARIABLES: tuple[str, ...] = (
+    "context_block",
+    "role",
+    "work_item_goal",
+    "work_item_id",
+    "work_item_title",
 )
 _SIGNATURE_RE = re.compile(
     r"^\s*(?:async\s+def|def|class|interface|export\s+function|export\s+class|"
@@ -183,8 +188,8 @@ class ContextAssemblerConfig:
     summary_threshold_bytes: int = 8_192
     min_truncation_tokens: int = 32
     enforce_scope_filter: bool = True
-    exclude_untrusted_suspicious: bool = True
-    redact_untrusted_content: bool = True
+    hygiene_mode: str = DEFAULT_POLICY_MODE.value
+    minimal_mode: bool = False
 
     def __post_init__(self) -> None:
         if self.max_context_tokens <= 0:
@@ -193,6 +198,16 @@ class ContextAssemblerConfig:
             raise ValueError("summary_threshold_bytes must be > 0")
         if self.min_truncation_tokens <= 0:
             raise ValueError("min_truncation_tokens must be > 0")
+
+
+@dataclass(frozen=True, slots=True)
+class _PromptRenderResult:
+    prompt: str
+    prompt_hash: str
+    renderer: str
+    template_hash: str | None = None
+    template_name: str | None = None
+    template_version: str | None = None
 
 
 class ContextAssembler:
@@ -217,7 +232,10 @@ class ContextAssembler:
         self._token_estimator = token_estimator or _default_token_estimator
         self._spec_map = spec_map
         self._interface_contracts = dict(interface_contracts or {})
-        self._prompt_renderer = prompt_renderer or _render_prompt_fallback
+        self._prompt_renderer = prompt_renderer
+        self._template_engine: PromptTemplateEngine | None = None
+        if self._prompt_renderer is None and not self._config.minimal_mode:
+            self._template_engine = PromptTemplateEngine(hygiene_mode=self._config.hygiene_mode)
 
         self._cached_index: object | None = None
         self._cached_refresh_key: str | None = None
@@ -277,8 +295,9 @@ class ContextAssembler:
             optional_docs=normalized_optional,
             token_budget=effective_budget,
         )
-        prompt = self._render_prompt(role=role, work_item=work_item, docs=all_docs)
-        prompt_hash = sha256_text(prompt)
+        render_result = self._render_prompt(role=role, work_item=work_item, docs=all_docs)
+        prompt = render_result.prompt
+        prompt_hash = render_result.prompt_hash
 
         manifest = tuple(
             ContextManifestEntry(
@@ -308,6 +327,11 @@ class ContextAssembler:
                 "token_estimate": sum(item.token_estimate for item in manifest),
                 "refresh_key": index_refresh_key,
                 "changed_paths": list(changed_paths),
+                "prompt_hash": prompt_hash,
+                "prompt_renderer": render_result.renderer,
+                "template_hash": render_result.template_hash,
+                "template_name": render_result.template_name,
+                "template_version": render_result.template_version,
             },
         )
 
@@ -514,30 +538,33 @@ class ContextAssembler:
         return tuple(filtered)
 
     def _normalize_doc(self, doc: ContextDoc, *, allow_summary: bool) -> ContextDoc:
-        trusted = _is_trusted_path(doc.path)
-        suspicious = bool(_SUSPICIOUS_INSTRUCTION_RE.search(doc.content))
-
-        if suspicious and not trusted and self._config.exclude_untrusted_suspicious:
-            return ContextDoc(
-                name=doc.name,
-                path=doc.path,
-                doc_type=doc.doc_type,
-                content="",
-                content_hash=doc.content_hash,
-                why_included=f"{doc.why_included}; excluded_by_hygiene=true",
-                metadata={**doc.metadata, "excluded_by_hygiene": True},
-            )
-
-        content = doc.content
-        if suspicious and not trusted and self._config.redact_untrusted_content:
-            content = redact_text(content)
-
+        hygiene = sanitize_context(
+            _normalize_newlines(doc.content),
+            path=doc.path,
+            doc_type=doc.doc_type,
+            mode=self._config.hygiene_mode,
+        )
+        content = hygiene.sanitized_text
         bytes_total = len(content.encode("utf-8"))
+        why = doc.why_included
+        if hygiene.dropped:
+            why = f"{why}; hygiene=dropped"
+        elif hygiene.findings:
+            why = f"{why}; hygiene=findings={len(hygiene.findings)}"
         if allow_summary and bytes_total > self._config.summary_threshold_bytes:
             content = _deterministic_summary(content=content, path=doc.path)
-            why = f"{doc.why_included}; summary_mode=deterministic"
-        else:
-            why = doc.why_included
+            why = f"{why}; summary_mode=deterministic"
+
+        metadata: dict[str, JSONValue] = {
+            **doc.metadata,
+            "bytes_total": bytes_total,
+            "hygiene_mode": hygiene.mode.value,
+            "hygiene_trust": hygiene.trust.value,
+            "hygiene_findings": len(hygiene.findings),
+            "hygiene_dropped": hygiene.dropped,
+        }
+        if hygiene.reasons:
+            metadata["hygiene_reasons"] = list(hygiene.reasons)
 
         return ContextDoc(
             name=doc.name,
@@ -546,7 +573,7 @@ class ContextAssembler:
             content=content,
             content_hash=sha256_text(content),
             why_included=why,
-            metadata={**doc.metadata, "bytes_total": bytes_total, "trusted": trusted},
+            metadata=metadata,
         )
 
     def _estimate_doc_tokens(self, doc: ContextDoc) -> int:
@@ -586,8 +613,6 @@ class ContextAssembler:
             remaining -= self._estimate_doc_tokens(doc)
 
         for doc in optional_docs:
-            if doc.metadata.get("excluded_by_hygiene") is True:
-                continue
             if remaining <= 0:
                 break
             cost = self._estimate_doc_tokens(doc)
@@ -623,14 +648,48 @@ class ContextAssembler:
         )
         return included_sorted, tuple(truncations), rationale
 
-    def _render_prompt(self, *, role: str, work_item: WorkItem, docs: Sequence[ContextDoc]) -> str:
-        try:
+    def _render_prompt(
+        self, *, role: str, work_item: WorkItem, docs: Sequence[ContextDoc]
+    ) -> _PromptRenderResult:
+        if self._prompt_renderer is not None:
             prompt = self._prompt_renderer(role, work_item, docs)
-        except Exception:
+            return _prompt_result(prompt=prompt, renderer="custom")
+
+        if self._config.minimal_mode:
             prompt = _render_prompt_fallback(role, work_item, docs)
-        if not isinstance(prompt, str) or not prompt.strip():
-            prompt = _render_prompt_fallback(role, work_item, docs)
-        return prompt
+            return _prompt_result(prompt=prompt, renderer="minimal")
+
+        if self._template_engine is None:  # pragma: no cover - defensive guard
+            raise RuntimeError("template engine must be configured when minimal_mode is disabled")
+
+        context_block = _render_context_block(role=role, work_item=work_item, docs=docs)
+        rendered = self._template_engine.render(
+            role,
+            variables={
+                "context_block": context_block,
+                "role": role,
+                "work_item_goal": work_item.description,
+                "work_item_id": work_item.id,
+                "work_item_title": work_item.title,
+            },
+            allowed_variables=_TEMPLATE_RENDER_VARIABLES,
+            trusted_variables=_TEMPLATE_RENDER_VARIABLES,
+        )
+
+        if "context_block" in rendered.template_metadata.declared_variables:
+            prompt = rendered.prompt
+        else:
+            prompt = "\n\n".join((rendered.prompt.rstrip("\n"), context_block))
+
+        result = _prompt_result(prompt=prompt, renderer="template")
+        return _PromptRenderResult(
+            prompt=result.prompt,
+            prompt_hash=result.prompt_hash,
+            renderer=result.renderer,
+            template_hash=rendered.template_metadata.template_hash,
+            template_name=rendered.template_metadata.template_name,
+            template_version=rendered.template_metadata.template_version,
+        )
 
 
 def _build_doc(*, name: str, path: str, doc_type: str, content: str, why: str) -> ContextDoc:
@@ -799,18 +858,6 @@ def _safe_relative_path(path: str) -> bool:
     return all(part not in {"", ".", ".."} for part in pure.parts)
 
 
-def _is_trusted_path(path: str) -> bool:
-    lowered = path.lower()
-    trusted_prefixes = (
-        "docs/schemas/",
-        "docs/prompts/templates/",
-        "constraints/registry/",
-        "_meta/",
-        "_contracts/",
-    )
-    return lowered.startswith(trusted_prefixes)
-
-
 def _doc_sort_group(doc_type: str) -> int:
     if doc_type in {"work_item_contract", "work_item_scope", "constraint_envelope", "budget"}:
         return 0
@@ -889,6 +936,10 @@ def _deterministic_summary(*, content: str, path: str) -> str:
 
 
 def _render_prompt_fallback(role: str, work_item: WorkItem, docs: Sequence[ContextDoc]) -> str:
+    return _render_context_block(role=role, work_item=work_item, docs=docs)
+
+
+def _render_context_block(*, role: str, work_item: WorkItem, docs: Sequence[ContextDoc]) -> str:
     sections: list[str] = []
     sections.append(f"ROLE: {role}")
     sections.append(f"WORK_ITEM_ID: {work_item.id}")
@@ -908,6 +959,23 @@ def _render_prompt_fallback(role: str, work_item: WorkItem, docs: Sequence[Conte
         )
     sections.append("CONTEXT_END")
     return "\n".join(sections)
+
+
+def _prompt_result(*, prompt: object, renderer: str) -> _PromptRenderResult:
+    if not isinstance(prompt, str):
+        raise TypeError("prompt renderer must return a string")
+    normalized = _normalize_newlines(prompt)
+    if not normalized.strip():
+        raise ValueError("prompt renderer must return a non-empty prompt")
+    return _PromptRenderResult(
+        prompt=normalized,
+        prompt_hash=sha256_text(normalized),
+        renderer=renderer,
+    )
+
+
+def _normalize_newlines(text: str) -> str:
+    return text.replace("\r\n", "\n").replace("\r", "\n")
 
 
 __all__ = [

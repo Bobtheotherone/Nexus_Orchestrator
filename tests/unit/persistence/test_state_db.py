@@ -2,14 +2,20 @@
 
 from __future__ import annotations
 
+import asyncio
 import sqlite3
 import threading
 import time
 from typing import TYPE_CHECKING
 
+import pytest
+
 from nexus_orchestrator.constants import STATE_DB_SCHEMA_VERSION
 from nexus_orchestrator.persistence.repositories import RunRepo
-from nexus_orchestrator.persistence.state_db import StateDB
+from nexus_orchestrator.persistence.state_db import (
+    StateDB,
+    StateDBAsyncPolicyError,
+)
 
 from . import make_run
 
@@ -51,6 +57,7 @@ def test_migration_idempotence_schema_version_and_pragmas(tmp_path: Path) -> Non
             "provider_calls",
             "tool_installs",
             "incidents",
+            "merge_queue_states",
         }
         assert expected_tables.issubset(tables)
 
@@ -179,3 +186,75 @@ def test_wal_allows_reader_during_open_writer_transaction(tmp_path: Path) -> Non
     assert reader_count == 1
     assert reader_elapsed is not None
     assert reader_elapsed < 0.75
+
+
+@pytest.mark.asyncio
+async def test_strict_async_policy_blocks_sync_db_io_on_event_loop(tmp_path: Path) -> None:
+    db = StateDB(
+        tmp_path / "state" / "nexus.sqlite3",
+        async_blocking_policy="strict",
+    )
+
+    with pytest.raises(StateDBAsyncPolicyError):
+        db.migrate()
+
+    version = await db.migrate_async()
+    assert version == STATE_DB_SCHEMA_VERSION
+
+    with pytest.raises(StateDBAsyncPolicyError):
+        db.query_one("SELECT 1 AS one")
+
+
+@pytest.mark.asyncio
+async def test_async_db_stress_does_not_stall_event_loop(tmp_path: Path) -> None:
+    db = StateDB(
+        tmp_path / "state" / "nexus.sqlite3",
+        async_blocking_policy="strict",
+    )
+    await db.migrate_async()
+    await db.execute_async(
+        """
+        CREATE TABLE IF NOT EXISTS async_stress (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            payload TEXT NOT NULL
+        )
+        """
+    )
+
+    worker_count = 8
+    iterations_per_worker = 80
+    monitor_interval_seconds = 0.005
+    max_allowed_stall_seconds = 0.12
+
+    max_observed_stall = 0.0
+    monitor_stop = asyncio.Event()
+
+    async def monitor_loop_stall() -> None:
+        nonlocal max_observed_stall
+        while not monitor_stop.is_set():
+            start = time.monotonic()
+            await asyncio.sleep(monitor_interval_seconds)
+            drift = max(0.0, time.monotonic() - start - monitor_interval_seconds)
+            max_observed_stall = max(max_observed_stall, drift)
+
+    async def db_worker(worker_id: int) -> None:
+        for iteration in range(iterations_per_worker):
+            await db.execute_async(
+                "INSERT INTO async_stress (payload) VALUES (?)",
+                (f"{worker_id}:{iteration}",),
+            )
+            if iteration % 10 == 0:
+                row = await db.query_one_async("SELECT COUNT(*) AS c FROM async_stress")
+                assert row is not None
+                assert "c" in row
+            await asyncio.sleep(0)
+
+    monitor_task = asyncio.create_task(monitor_loop_stall())
+    await asyncio.gather(*(db_worker(index) for index in range(worker_count)))
+    monitor_stop.set()
+    await monitor_task
+
+    row = await db.query_one_async("SELECT COUNT(*) AS c FROM async_stress")
+    assert row is not None
+    assert int(row["c"]) == worker_count * iterations_per_worker
+    assert max_observed_stall < max_allowed_stall_seconds

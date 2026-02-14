@@ -18,6 +18,9 @@ Non-functional requirements
 - Checker execution must be sandboxed.
 """
 
+from nexus_orchestrator.verification_plane.adversarial.test_generator import (
+    AdversarialTestGenerator,
+)
 from nexus_orchestrator.verification_plane.checkers.base import (
     DEFAULT_CHECKER_REGISTRY,
     BaseChecker,
@@ -60,6 +63,7 @@ from nexus_orchestrator.verification_plane.checkers.typecheck_checker import Typ
 
 __all__ = [
     "BaseChecker",
+    "AdversarialTestGenerator",
     "BuildChecker",
     "CheckResult",
     "CheckStatus",

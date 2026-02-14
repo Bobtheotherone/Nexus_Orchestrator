@@ -16,6 +16,11 @@ from dataclasses import dataclass, field
 
 import pytest
 
+from nexus_orchestrator.synthesis_plane.model_catalog import (
+    ModelCapabilities,
+    ModelCatalog,
+    ModelCostEstimate,
+)
 from nexus_orchestrator.synthesis_plane.providers import (
     AnthropicAdapter,
     BackoffConfig,
@@ -34,6 +39,8 @@ from nexus_orchestrator.synthesis_plane.providers import (
 from nexus_orchestrator.synthesis_plane.providers.base import (
     ProviderError,
     ProviderRegistry,
+    RemoteMCPToolConfig,
+    StructuredOutputDefinition,
     instantiate_provider_error,
     provider_error_subclasses,
 )
@@ -117,6 +124,10 @@ def _request(
     model: str,
     prompt: str,
     idempotency_key: str | None = None,
+    structured_output: StructuredOutputDefinition | None = None,
+    remote_mcp_tools: tuple[RemoteMCPToolConfig, ...] = (),
+    tool_choice: str | None = None,
+    reasoning_effort: str | None = None,
 ) -> ProviderRequest:
     return ProviderRequest(
         model=model,
@@ -130,7 +141,44 @@ def _request(
                 json_schema={"type": "object", "properties": {"id": {"type": "string"}}},
             ),
         ),
+        structured_output=structured_output,
+        remote_mcp_tools=remote_mcp_tools,
+        tool_choice=tool_choice,
+        reasoning_effort=reasoning_effort,
         idempotency_key=idempotency_key,
+    )
+
+
+def _catalog_for_model(
+    *,
+    provider: str,
+    model: str,
+    max_context_tokens: int,
+    supports_tool_calling: bool,
+    supports_structured_outputs: bool,
+    blended_per_1k_usd: float,
+) -> ModelCatalog:
+    return ModelCatalog(
+        version="test",
+        last_updated="2026-02-13",
+        models=(
+            ModelCapabilities(
+                provider=provider,
+                model=model,
+                max_context_tokens=max_context_tokens,
+                supports_tool_calling=supports_tool_calling,
+                supports_structured_outputs=supports_structured_outputs,
+                reasoning_effort_allowed=("low", "medium", "high"),
+                cost=ModelCostEstimate(
+                    input_per_1k_usd=blended_per_1k_usd,
+                    output_per_1k_usd=blended_per_1k_usd,
+                    blended_per_1k_usd=blended_per_1k_usd,
+                ),
+                availability="test",
+                notes="test-entry",
+            ),
+        ),
+        default_profiles={},
     )
 
 
@@ -144,6 +192,14 @@ def test_provider_request_contract_fields_and_aliases() -> None:
         context_docs=(ContextDocument(name="constraints", content="must pass"),),
         requested_tools=("ruff", "pytest"),
         budget=BudgetSnapshot(max_total_tokens=4_096, max_cost_usd=1.25),
+        structured_output_schema={
+            "type": "object",
+            "properties": {"status": {"type": "string"}},
+            "required": ["status"],
+        },
+        structured_output_name="status_payload",
+        tool_choice="auto",
+        reasoning_effort="medium",
         metadata={"work_item_id": "WI-42"},
     )
 
@@ -155,6 +211,50 @@ def test_provider_request_contract_fields_and_aliases() -> None:
     assert request.budget is not None
     assert request.budget.max_total_tokens == 4_096
     assert request.metadata["work_item_id"] == "WI-42"
+    assert request.structured_output is not None
+    assert request.structured_output.name == "status_payload"
+    assert request.tool_choice == "auto"
+    assert request.reasoning_effort == "medium"
+
+
+def test_openai_adapter_capabilities_are_catalog_driven_not_prefix_heuristics() -> None:
+    catalog = _catalog_for_model(
+        provider="openai",
+        model="openai-custom-alpha",
+        max_context_tokens=65_535,
+        supports_tool_calling=False,
+        supports_structured_outputs=False,
+        blended_per_1k_usd=0.123,
+    )
+    adapter = OpenAIAdapter(
+        model="openai-custom-alpha",
+        client=_FakeOpenAIClient(responses=_ScriptedOpenAIResponses(outcomes=deque())),
+        model_catalog=catalog,
+    )
+
+    assert adapter.supports_tool_calling("openai-custom-alpha") is False
+    assert adapter.max_context_tokens("openai-custom-alpha") == 65_535
+    assert adapter.estimate_cost(2_000, "openai-custom-alpha") == pytest.approx(0.246)
+
+
+def test_anthropic_adapter_capabilities_are_catalog_driven_not_prefix_heuristics() -> None:
+    catalog = _catalog_for_model(
+        provider="anthropic",
+        model="anthropic-custom-beta",
+        max_context_tokens=99_999,
+        supports_tool_calling=False,
+        supports_structured_outputs=False,
+        blended_per_1k_usd=0.321,
+    )
+    adapter = AnthropicAdapter(
+        model="anthropic-custom-beta",
+        client=_FakeAnthropicClient(messages=_ScriptedAnthropicMessages(outcomes=deque())),
+        model_catalog=catalog,
+    )
+
+    assert adapter.supports_tool_calling("anthropic-custom-beta") is False
+    assert adapter.max_context_tokens("anthropic-custom-beta") == 99_999
+    assert adapter.estimate_cost(1_000, "anthropic-custom-beta") == pytest.approx(0.321)
 
 
 def test_compute_backoff_delay_is_bounded_and_deterministic() -> None:
@@ -330,6 +430,75 @@ async def test_openai_adapter_normalizes_response_content_tools_and_usage() -> N
 
 
 @pytest.mark.unit
+async def test_openai_adapter_wires_structured_output_and_remote_mcp_payload(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("OPENAI_MCP_TOKEN", "mcp-token-123")
+    fake_api = _ScriptedOpenAIResponses(
+        outcomes=deque(
+            [
+                {
+                    "id": "resp-structured",
+                    "model": "gpt-4.1-mini",
+                    "output": [
+                        {
+                            "type": "message",
+                            "content": [
+                                {"type": "output_text", "text": "JSON result"},
+                                {"type": "output_json", "json": {"status": "ok", "id": "REQ-9"}},
+                            ],
+                        }
+                    ],
+                    "usage": {"input_tokens": 10, "output_tokens": 5, "total_tokens": 15},
+                }
+            ]
+        )
+    )
+    adapter = OpenAIAdapter(model="gpt-4.1-mini", client=_FakeOpenAIClient(responses=fake_api))
+
+    response = await adapter.send(
+        _request(
+            model="gpt-4.1-mini",
+            prompt="Return JSON summary",
+            structured_output=StructuredOutputDefinition(
+                name="issue_summary",
+                json_schema={
+                    "type": "object",
+                    "properties": {
+                        "status": {"type": "string"},
+                        "id": {"type": "string"},
+                    },
+                    "required": ["status", "id"],
+                },
+            ),
+            tool_choice="required",
+            remote_mcp_tools=(
+                RemoteMCPToolConfig(
+                    server_label="code-index",
+                    server_url="https://mcp.local/index",
+                    allowed_tools=("search",),
+                    authorization_token_env="OPENAI_MCP_TOKEN",
+                ),
+            ),
+        )
+    )
+
+    assert response.structured_output == {"status": "ok", "id": "REQ-9"}
+    payload = fake_api.calls[0]
+    assert payload["text"]["format"]["type"] == "json_schema"
+    assert payload["text"]["format"]["name"] == "issue_summary"
+    assert payload["tool_choice"] == "required"
+
+    tool_entries = payload["tools"]
+    assert isinstance(tool_entries, list)
+    assert any(tool["type"] == "function" for tool in tool_entries)
+    mcp_entries = [tool for tool in tool_entries if tool.get("type") == "mcp"]
+    assert len(mcp_entries) == 1
+    assert mcp_entries[0]["server_label"] == "code-index"
+    assert mcp_entries[0]["headers"]["Authorization"] == "Bearer mcp-token-123"
+
+
+@pytest.mark.unit
 async def test_openai_adapter_supports_tool_only_responses() -> None:
     fake_api = _ScriptedOpenAIResponses(
         outcomes=deque(
@@ -487,6 +656,87 @@ async def test_anthropic_adapter_normalizes_text_tool_use_and_usage() -> None:
 
 
 @pytest.mark.unit
+async def test_anthropic_adapter_wires_structured_output_and_mcp_servers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("ANTHROPIC_MCP_TOKEN", "anth-token-999")
+    fake_api = _ScriptedAnthropicMessages(
+        outcomes=deque(
+            [
+                {
+                    "id": "msg-structured",
+                    "model": "claude-3-7-sonnet",
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": "toolu-structured",
+                            "name": "issue_summary",
+                            "input": {"status": "ok", "count": 2},
+                        },
+                        {
+                            "type": "tool_use",
+                            "id": "toolu-call",
+                            "name": "lookup_contract",
+                            "input": {"id": "REQ-555"},
+                        },
+                    ],
+                    "usage": {"input_tokens": 15, "output_tokens": 6, "total_tokens": 21},
+                    "stop_reason": "tool_use",
+                }
+            ]
+        )
+    )
+    adapter = AnthropicAdapter(
+        model="claude-3-7-sonnet",
+        client=_FakeAnthropicClient(messages=fake_api),
+    )
+
+    response = await adapter.send(
+        _request(
+            model="claude-3-7-sonnet",
+            prompt="Return structured summary and tool call",
+            structured_output=StructuredOutputDefinition(
+                name="issue_summary",
+                json_schema={
+                    "type": "object",
+                    "properties": {
+                        "status": {"type": "string"},
+                        "count": {"type": "integer"},
+                    },
+                    "required": ["status", "count"],
+                },
+            ),
+            remote_mcp_tools=(
+                RemoteMCPToolConfig(
+                    server_label="repo-mcp",
+                    server_url="https://mcp.local/repo",
+                    allowed_tools=("search", "read"),
+                    authorization_token_env="ANTHROPIC_MCP_TOKEN",
+                ),
+            ),
+        )
+    )
+
+    assert response.structured_output == {"status": "ok", "count": 2}
+    assert len(response.tool_calls) == 1
+    assert response.tool_calls[0].name == "lookup_contract"
+    payload = fake_api.calls[0]
+    assert payload["response_format"]["type"] == "json_schema"
+    assert payload["response_format"]["json_schema"]["name"] == "issue_summary"
+
+    tools = payload["tools"]
+    assert isinstance(tools, list)
+    assert any(tool.get("name") == "lookup_contract" for tool in tools)
+    assert any(tool.get("name") == "issue_summary" for tool in tools)
+    assert payload["tool_choice"] == {"type": "tool", "name": "issue_summary"}
+
+    mcp_servers = payload["mcp_servers"]
+    assert isinstance(mcp_servers, list)
+    assert mcp_servers[0]["server_name"] == "repo-mcp"
+    assert mcp_servers[0]["headers"]["Authorization"] == "Bearer anth-token-999"
+
+
+@pytest.mark.unit
 async def test_anthropic_adapter_retries_connection_failures_and_reuses_idempotency_key() -> None:
     fake_api = _ScriptedAnthropicMessages(
         outcomes=deque(
@@ -551,6 +801,50 @@ async def test_sdk_missing_raises_provider_unavailable_only_when_send_called(
         match=r"provider=anthropic code=unavailable retryable=false detail=anthropic SDK is not installed",
     ):
         await anthropic_adapter.send(_request(model="claude-3-7-sonnet", prompt="x"))
+
+
+def test_openai_adapter_prefers_configured_api_key_env_without_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("NEXUS_CONFIG_OPENAI_KEY", "config-key")
+    monkeypatch.setenv("OPENAI_API_KEY", "fallback-key")
+
+    adapter = OpenAIAdapter(model="gpt-4.1-mini", api_key_env="NEXUS_CONFIG_OPENAI_KEY")
+
+    assert adapter._resolve_api_key() == "config-key"
+
+
+def test_openai_adapter_raises_when_configured_api_key_env_is_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("NEXUS_CONFIG_OPENAI_KEY", raising=False)
+    monkeypatch.setenv("OPENAI_API_KEY", "fallback-key")
+
+    adapter = OpenAIAdapter(model="gpt-4.1-mini", api_key_env="NEXUS_CONFIG_OPENAI_KEY")
+
+    with pytest.raises(
+        ProviderAuthError,
+        match=r"configured env var NEXUS_CONFIG_OPENAI_KEY",
+    ):
+        adapter._resolve_api_key()
+
+
+def test_anthropic_adapter_raises_when_configured_api_key_env_is_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("NEXUS_CONFIG_ANTHROPIC_KEY", raising=False)
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "fallback-key")
+
+    adapter = AnthropicAdapter(
+        model="claude-3-7-sonnet",
+        api_key_env="NEXUS_CONFIG_ANTHROPIC_KEY",
+    )
+
+    with pytest.raises(
+        ProviderAuthError,
+        match=r"configured env var NEXUS_CONFIG_ANTHROPIC_KEY",
+    ):
+        adapter._resolve_api_key()
 
 
 @pytest.mark.unit

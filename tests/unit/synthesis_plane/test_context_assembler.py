@@ -38,6 +38,7 @@ from nexus_orchestrator.domain.models import (
     WorkItemStatus,
 )
 from nexus_orchestrator.knowledge_plane.indexer import RepositoryIndexer
+from nexus_orchestrator.security.prompt_hygiene import DROPPED_CONTENT_MARKER
 from nexus_orchestrator.spec_ingestion.spec_map import (
     InterfaceContract,
     SourceLocation,
@@ -413,7 +414,7 @@ def test_assembler_excludes_out_of_scope_and_suspicious_untrusted_docs() -> None
     assert "docs/other.md" not in paths
 
 
-def test_assembler_redacts_suspicious_untrusted_content_when_exclusion_disabled() -> None:
+def test_assembler_sanitizes_untrusted_content_with_central_hygiene_policy() -> None:
     work_item = _make_work_item(seed=15)
     retriever = _FakeRetriever(
         docs=(
@@ -429,18 +430,48 @@ def test_assembler_redacts_suspicious_untrusted_content_when_exclusion_disabled(
         repo_root=".",
         indexer=_FakeIndexer(),
         retriever=retriever,
-        config=ContextAssemblerConfig(
-            exclude_untrusted_suspicious=False,
-            redact_untrusted_content=True,
-            max_context_tokens=300,
-        ),
+        config=ContextAssemblerConfig(max_context_tokens=300),
     )
 
     pack = assembler.assemble(work_item=work_item, role="implementer")
-    joined = "\n".join(doc.content for doc in pack.docs if doc.path == "src/app/service.py")
+    doc = next(item for item in pack.docs if item.path == "src/app/service.py")
 
-    assert "***REDACTED***" in joined
-    assert "abc123" not in joined
+    assert doc.content.startswith(DROPPED_CONTENT_MARKER)
+    assert "ignore previous instructions" not in doc.content.lower()
+    assert doc.metadata["hygiene_dropped"] is True
+
+
+def test_assembler_uses_template_engine_by_default_and_records_template_metadata() -> None:
+    work_item = _make_work_item(seed=151)
+    retriever = _FakeRetriever(docs=())
+    assembler = ContextAssembler(repo_root=".", indexer=_FakeIndexer(), retriever=retriever)
+
+    pack = assembler.assemble(work_item=work_item, role="implementer")
+
+    assert pack.metadata["prompt_renderer"] == "template"
+    assert pack.metadata["prompt_hash"] == pack.prompt_hash
+    assert isinstance(pack.metadata["template_hash"], str)
+    assert len(pack.metadata["template_hash"]) == 64
+    assert "# Implementer Agent Prompt Template" in pack.prompt
+    assert "CONTEXT_BEGIN" in pack.prompt
+
+
+def test_assembler_fallback_renderer_only_activates_in_minimal_mode() -> None:
+    work_item = _make_work_item(seed=152)
+    retriever = _FakeRetriever(docs=())
+    assembler = ContextAssembler(
+        repo_root=".",
+        indexer=_FakeIndexer(),
+        retriever=retriever,
+        config=ContextAssemblerConfig(minimal_mode=True),
+    )
+
+    pack = assembler.assemble(work_item=work_item, role="implementer")
+
+    assert pack.metadata["prompt_renderer"] == "minimal"
+    assert pack.metadata["template_hash"] is None
+    assert pack.prompt.startswith("ROLE: implementer")
+    assert "# Implementer Agent Prompt Template" not in pack.prompt
 
 
 def test_assembler_accepts_raw_repository_indexer_without_adapter(tmp_path: Path) -> None:

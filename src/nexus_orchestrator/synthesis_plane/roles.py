@@ -27,6 +27,7 @@ from types import MappingProxyType
 from typing import TypeAlias
 
 from nexus_orchestrator.domain.models import RiskTier
+from nexus_orchestrator.synthesis_plane.model_catalog import ModelCatalog, load_model_catalog
 
 JSONScalar: TypeAlias = str | int | float | bool | None
 JSONValue: TypeAlias = JSONScalar | list["JSONValue"] | dict[str, "JSONValue"]
@@ -552,19 +553,30 @@ class RoleRegistry:
         )
 
     @classmethod
-    def default(cls) -> RoleRegistry:
+    def default(cls, *, model_catalog: ModelCatalog | None = None) -> RoleRegistry:
+        catalog = model_catalog if model_catalog is not None else load_model_catalog()
+        profile_models = _resolve_provider_profile_models(config=None, model_catalog=catalog)
         return cls(
-            roles=_default_roles(),
+            roles=_default_roles(profile_models=profile_models),
             risk_tier_requirements=_default_risk_tier_requirements(),
         )
 
     @classmethod
     def from_config(cls, config: Mapping[str, object] | None) -> RoleRegistry:
-        registry = cls.default()
+        model_catalog = load_model_catalog()
+        registry = cls.default(model_catalog=model_catalog)
         if config is None:
             return registry
         if not isinstance(config, Mapping):
             raise ValueError("config must be a mapping")
+
+        profile_models = _resolve_provider_profile_models(
+            config=config, model_catalog=model_catalog
+        )
+        registry = cls(
+            roles=_default_roles(profile_models=profile_models),
+            risk_tier_requirements=_default_risk_tier_requirements(),
+        )
 
         role_section_raw = config.get("roles", {})
         if role_section_raw is None:
@@ -754,39 +766,181 @@ def _assert_known_role_names(names: set[str] | None, known: set[str], field_name
         raise ValueError(f"{field_name} contains unknown roles: {unknown}")
 
 
-def _default_codex_ladder() -> EscalationPolicy:
+_PROFILE_CODE = "code"
+_PROFILE_ARCHITECT = "architect"
+
+
+def _resolve_provider_profile_models(
+    *,
+    config: Mapping[str, object] | None,
+    model_catalog: ModelCatalog,
+) -> Mapping[str, Mapping[str, str]]:
+    providers_raw = config.get("providers") if isinstance(config, Mapping) else None
+    providers = providers_raw if isinstance(providers_raw, Mapping) else {}
+
+    provider_models: dict[str, Mapping[str, str]] = {}
+    for provider_name in ("openai", "anthropic", "local"):
+        provider_cfg_raw = providers.get(provider_name)
+        provider_cfg = provider_cfg_raw if isinstance(provider_cfg_raw, Mapping) else {}
+
+        configured_code = provider_cfg.get("model_code")
+        configured_architect = provider_cfg.get("model_architect")
+        configured_code_model = configured_code if isinstance(configured_code, str) else None
+        configured_architect_model = (
+            configured_architect if isinstance(configured_architect, str) else None
+        )
+        try:
+            resolved_code = model_catalog.resolve_model_for_profile(
+                provider=provider_name,
+                capability_profile=_PROFILE_CODE,
+                configured_model=configured_code_model,
+            )
+            resolved_architect = model_catalog.resolve_model_for_profile(
+                provider=provider_name,
+                capability_profile=_PROFILE_ARCHITECT,
+                configured_model=configured_architect_model,
+            )
+        except KeyError as exc:
+            raise ValueError(
+                f"unable to resolve provider model profile for {provider_name}: {exc}"
+            ) from exc
+
+        provider_models[provider_name] = MappingProxyType(
+            {
+                _PROFILE_CODE: resolved_code,
+                _PROFILE_ARCHITECT: resolved_architect,
+            }
+        )
+
+    return MappingProxyType(provider_models)
+
+
+def _profile_model(
+    profile_models: Mapping[str, Mapping[str, str]],
+    *,
+    provider: str,
+    capability_profile: str,
+) -> str:
+    provider_map = profile_models.get(provider)
+    if provider_map is None:
+        raise ValueError(f"missing profile model mapping for provider {provider!r}")
+    model = provider_map.get(capability_profile)
+    if model is None:
+        raise ValueError(
+            f"missing capability profile {capability_profile!r} for provider {provider!r}"
+        )
+    return model
+
+
+def _default_codex_ladder(
+    *,
+    profile_models: Mapping[str, Mapping[str, str]],
+) -> EscalationPolicy:
     return EscalationPolicy(
         steps=(
-            EscalationStep(provider="openai", model="gpt-5-codex", attempts=2),
-            EscalationStep(provider="anthropic", model="claude-sonnet-4-5", attempts=2),
-            EscalationStep(provider="anthropic", model="claude-opus-4-6", attempts=1),
+            EscalationStep(
+                provider="openai",
+                model=_profile_model(
+                    profile_models,
+                    provider="openai",
+                    capability_profile=_PROFILE_CODE,
+                ),
+                attempts=2,
+            ),
+            EscalationStep(
+                provider="anthropic",
+                model=_profile_model(
+                    profile_models,
+                    provider="anthropic",
+                    capability_profile=_PROFILE_CODE,
+                ),
+                attempts=2,
+            ),
+            EscalationStep(
+                provider="anthropic",
+                model=_profile_model(
+                    profile_models,
+                    provider="anthropic",
+                    capability_profile=_PROFILE_ARCHITECT,
+                ),
+                attempts=1,
+            ),
         )
     )
 
 
-def _default_hybrid_ladder() -> EscalationPolicy:
+def _default_hybrid_ladder(
+    *,
+    profile_models: Mapping[str, Mapping[str, str]],
+) -> EscalationPolicy:
     return EscalationPolicy(
         steps=(
-            EscalationStep(provider="openai", model="gpt-5-codex", attempts=1),
-            EscalationStep(provider="anthropic", model="claude-sonnet-4-5", attempts=2),
-            EscalationStep(provider="anthropic", model="claude-opus-4-6", attempts=1),
+            EscalationStep(
+                provider="openai",
+                model=_profile_model(
+                    profile_models,
+                    provider="openai",
+                    capability_profile=_PROFILE_CODE,
+                ),
+                attempts=1,
+            ),
+            EscalationStep(
+                provider="anthropic",
+                model=_profile_model(
+                    profile_models,
+                    provider="anthropic",
+                    capability_profile=_PROFILE_CODE,
+                ),
+                attempts=2,
+            ),
+            EscalationStep(
+                provider="anthropic",
+                model=_profile_model(
+                    profile_models,
+                    provider="anthropic",
+                    capability_profile=_PROFILE_ARCHITECT,
+                ),
+                attempts=1,
+            ),
         )
     )
 
 
-def _default_claude_ladder() -> EscalationPolicy:
+def _default_claude_ladder(
+    *,
+    profile_models: Mapping[str, Mapping[str, str]],
+) -> EscalationPolicy:
     return EscalationPolicy(
         steps=(
-            EscalationStep(provider="anthropic", model="claude-sonnet-4-5", attempts=2),
-            EscalationStep(provider="anthropic", model="claude-opus-4-6", attempts=1),
+            EscalationStep(
+                provider="anthropic",
+                model=_profile_model(
+                    profile_models,
+                    provider="anthropic",
+                    capability_profile=_PROFILE_CODE,
+                ),
+                attempts=2,
+            ),
+            EscalationStep(
+                provider="anthropic",
+                model=_profile_model(
+                    profile_models,
+                    provider="anthropic",
+                    capability_profile=_PROFILE_ARCHITECT,
+                ),
+                attempts=1,
+            ),
         )
     )
 
 
-def _default_roles() -> tuple[AgentRole, ...]:
-    codex_ladder = _default_codex_ladder()
-    hybrid_ladder = _default_hybrid_ladder()
-    claude_ladder = _default_claude_ladder()
+def _default_roles(
+    *,
+    profile_models: Mapping[str, Mapping[str, str]],
+) -> tuple[AgentRole, ...]:
+    codex_ladder = _default_codex_ladder(profile_models=profile_models)
+    hybrid_ladder = _default_hybrid_ladder(profile_models=profile_models)
+    claude_ladder = _default_claude_ladder(profile_models=profile_models)
     return (
         AgentRole(
             name=ROLE_ARCHITECT,

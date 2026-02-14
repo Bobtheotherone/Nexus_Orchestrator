@@ -32,6 +32,7 @@ import pytest
 
 from nexus_orchestrator.security.redaction import REDACTED_VALUE
 from nexus_orchestrator.verification_plane.checkers import (
+    AdversarialTestGenerator,
     BuildChecker,
     CheckerContext,
     CheckStatus,
@@ -210,6 +211,16 @@ async def test_checkers_produce_required_fields_and_tool_versions(tmp_path: Path
                 "constraint_ids": ["CON-SEC-0001"],
             },
             "security_checker",
+        ),
+        (
+            "adversarial",
+            AdversarialTestGenerator(),
+            {
+                "scan_paths": ["src"],
+                "constraint_ids": ["CON-ADV-0001"],
+                "minimum_case_count": 1,
+            },
+            "adversarial/test_generator",
         ),
         (
             "scope",
@@ -409,6 +420,140 @@ async def test_security_dependency_audit_unavailable_fails_when_required(tmp_pat
 
     assert result.status is CheckStatus.FAIL
     assert any(item.code == "security.dependency_audit.unavailable" for item in result.violations)
+
+
+@pytest.mark.asyncio
+async def test_security_gitleaks_preferred_and_allowlist_applied(tmp_path: Path) -> None:
+    workspace = _seed_workspace(tmp_path).resolve()
+    _write_text(
+        workspace / "src" / "leaky.py",
+        (
+            "API_KEY='sk-visible-secret-aaaaaaaaaaaaaaaa'\n"
+            "API_KEY='sk-allowlisted-secret-bbbbbbbbbbbbbb'\n"
+        ),
+    )
+    gitleaks_report_path = (
+        workspace / ".nexus_orchestrator" / "checker_artifacts" / "security_checker_gitleaks.json"
+    )
+    gitleaks_report_path.parent.mkdir(parents=True, exist_ok=True)
+    gitleaks_report_path.write_text(
+        json.dumps(
+            [
+                {
+                    "RuleID": "generic-api-key",
+                    "Description": "hardcoded API key",
+                    "File": "src/leaky.py",
+                    "StartLine": 1,
+                    "Secret": "sk-visible-secret-aaaaaaaaaaaaaaaa",
+                    "Fingerprint": "src/leaky.py:generic-api-key:1",
+                },
+                {
+                    "RuleID": "generic-api-key",
+                    "Description": "allowlisted sample key",
+                    "File": "src/leaky.py",
+                    "StartLine": 2,
+                    "Secret": "sk-allowlisted-secret-bbbbbbbbbbbbbb",
+                    "Fingerprint": "src/leaky.py:generic-api-key:2",
+                },
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    detect_command = (
+        "gitleaks",
+        "detect",
+        "--source",
+        str(workspace),
+        "--no-git",
+        "--report-format",
+        "json",
+        "--report-path",
+        str(gitleaks_report_path),
+        "--redact",
+    )
+    executor = FakeExecutor(
+        responses={
+            ("gitleaks", "--version"): FakeOutcome(stdout="gitleaks 9.0.0"),
+            detect_command: FakeOutcome(exit_code=1),
+        }
+    )
+
+    result = await SecurityChecker().check(
+        CheckerContext(
+            workspace_path=str(workspace),
+            config={
+                "scan_type": "secret_patterns",
+                "gitleaks_allowlist": [{"fingerprint": "src/leaky.py:generic-api-key:2"}],
+            },
+            command_executor=executor,
+        )
+    )
+
+    assert result.status is CheckStatus.FAIL
+    assert any(
+        item.code == "security.secret.gitleaks" and item.path == "src/leaky.py" and item.line == 1
+        for item in result.violations
+    )
+    assert not any(
+        item.code == "security.secret.gitleaks" and item.path == "src/leaky.py" and item.line == 2
+        for item in result.violations
+    )
+    assert result.metadata["secret_scan_mode"] == "gitleaks"
+    assert "security.secret.gitleaks" in result.metadata["evidence_tags"]
+    assert "security.secret.regex_fallback" not in result.metadata["evidence_tags"]
+
+
+@pytest.mark.asyncio
+async def test_security_regex_fallback_adds_warning_evidence_when_gitleaks_unavailable(
+    tmp_path: Path,
+) -> None:
+    workspace = _seed_workspace(tmp_path)
+    _write_text(
+        workspace / "src" / "secrets.py",
+        "API_KEY = 'sk-fallback-secret-cccccccccccccccccccc'\n",
+    )
+    executor = FakeExecutor(
+        responses={
+            ("gitleaks", "--version"): FakeOutcome(
+                exit_code=None,
+                error="command not found",
+            )
+        }
+    )
+
+    result = await SecurityChecker().check(
+        CheckerContext(
+            workspace_path=str(workspace),
+            config={"scan_type": "secret_patterns", "scan_paths": ["src/secrets.py"]},
+            command_executor=executor,
+        )
+    )
+
+    assert result.status is CheckStatus.FAIL
+    assert any(item.code == "security.secret.gitleaks_unavailable" for item in result.violations)
+    assert any(item.code == "security.secret.api_key" for item in result.violations)
+    assert result.metadata["secret_scan_mode"] == "regex_fallback"
+    assert "security.secret.regex_fallback" in result.metadata["evidence_tags"]
+
+
+@pytest.mark.asyncio
+async def test_adversarial_checker_fails_when_no_targets_are_generated(tmp_path: Path) -> None:
+    workspace = _seed_workspace(tmp_path)
+    result = await AdversarialTestGenerator().check(
+        CheckerContext(
+            workspace_path=str(workspace),
+            config={
+                "scan_paths": ["docs"],
+                "minimum_targets": 1,
+                "minimum_case_count": 1,
+                "constraint_ids": ["CON-ADV-0001"],
+            },
+            command_executor=FakeExecutor(),
+        )
+    )
+    assert result.status is CheckStatus.FAIL
+    assert any(item.code == "adversarial.targets_insufficient" for item in result.violations)
 
 
 def test_violation_normalization_is_stable_under_deterministic_fuzz() -> None:

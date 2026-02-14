@@ -103,6 +103,45 @@ def test_implementer_escalation_ladder_is_deterministic_and_bounded() -> None:
     ]
 
 
+def test_provider_model_profiles_from_config_drive_routing_without_code_changes() -> None:
+    registry = RoleRegistry.from_config(
+        {
+            "providers": {
+                "openai": {
+                    "model_code": "gpt-4.1-mini",
+                    "model_architect": "gpt-5",
+                },
+                "anthropic": {
+                    "model_code": "claude-3-7-sonnet",
+                    "model_architect": "claude-opus-4-6",
+                },
+            }
+        }
+    )
+
+    first = registry.route_attempt(role_name=ROLE_IMPLEMENTER, attempt_number=1)
+    third = registry.route_attempt(role_name=ROLE_IMPLEMENTER, attempt_number=3)
+    fifth = registry.route_attempt(role_name=ROLE_IMPLEMENTER, attempt_number=5)
+
+    assert first is not None
+    assert first.model == "gpt-4.1-mini"
+    assert third is not None
+    assert third.model == "claude-3-7-sonnet"
+    assert fifth is not None
+    assert fifth.model == "claude-opus-4-6"
+
+
+def test_from_config_rejects_models_not_present_in_catalog() -> None:
+    with pytest.raises(ValueError, match="unable to resolve provider model profile for openai"):
+        RoleRegistry.from_config(
+            {
+                "providers": {
+                    "openai": {"model_code": "not-a-real-openai-model"},
+                }
+            }
+        )
+
+
 def test_budget_override_caps_escalation_attempts() -> None:
     registry = RoleRegistry.default()
     override = RoleBudget(max_attempts=3)

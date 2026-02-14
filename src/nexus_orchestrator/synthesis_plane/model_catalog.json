@@ -1,0 +1,170 @@
+// nexus-orchestrator — model catalog
+//
+// File: src/nexus_orchestrator/synthesis_plane/model_catalog.json
+// Last updated: 2026-02-13
+//
+// Purpose
+// - Canonical provider/model capability catalog for deterministic synthesis routing.
+//
+// What should be included in this file
+// - Provider/model capability metadata consumed by adapters and routing policy.
+// - Default capability profile mappings (code/architect/review) for each provider.
+//
+// Functional requirements
+// - Deterministic ordering and stable identifiers for repeatable routing decisions.
+// - Parseable offline without external network calls or runtime discovery.
+//
+// Non-functional requirements
+// - Must not include secrets or environment-specific values.
+// - Preserve backward-compatible aliases required by tests and configs.
+{
+  "version": "2026.02.13",
+  "last_updated": "2026-02-13",
+  "default_profiles": {
+    "openai": {
+      "code": "gpt-5-codex",
+      "architect": "gpt-5",
+      "review": "gpt-5"
+    },
+    "anthropic": {
+      "code": "claude-sonnet-4-5",
+      "architect": "claude-opus-4-6",
+      "review": "claude-opus-4-6"
+    },
+    "local": {
+      "code": "local-llama-3.1-70b",
+      "architect": "local-llama-3.1-70b",
+      "review": "local-llama-3.1-70b"
+    }
+  },
+  "models": [
+    {
+      "provider": "openai",
+      "model": "gpt-5-codex",
+      "aliases": ["gpt-5-codex-20260115"],
+      "max_context_tokens": 200000,
+      "supports_tool_calling": true,
+      "supports_structured_outputs": true,
+      "reasoning_effort_allowed": ["low", "medium", "high"],
+      "cost": {
+        "input_per_1k_usd": 0.0015,
+        "output_per_1k_usd": 0.006,
+        "blended_per_1k_usd": 0.004
+      },
+      "availability": "ga",
+      "notes": "Primary coding model for implementation and tool use."
+    },
+    {
+      "provider": "openai",
+      "model": "gpt-5",
+      "aliases": ["gpt-5-20260115"],
+      "max_context_tokens": 200000,
+      "supports_tool_calling": true,
+      "supports_structured_outputs": true,
+      "reasoning_effort_allowed": ["low", "medium", "high"],
+      "cost": {
+        "input_per_1k_usd": 0.002,
+        "output_per_1k_usd": 0.008,
+        "blended_per_1k_usd": 0.005
+      },
+      "availability": "ga",
+      "notes": "Higher-reasoning fallback for architecture and review tasks."
+    },
+    {
+      "provider": "openai",
+      "model": "gpt-4.1",
+      "aliases": ["gpt-4.1-20250115"],
+      "max_context_tokens": 128000,
+      "supports_tool_calling": true,
+      "supports_structured_outputs": true,
+      "reasoning_effort_allowed": ["low", "medium"],
+      "cost": {
+        "input_per_1k_usd": 0.003,
+        "output_per_1k_usd": 0.012,
+        "blended_per_1k_usd": 0.01
+      },
+      "availability": "ga",
+      "notes": "Stable general-purpose fallback."
+    },
+    {
+      "provider": "openai",
+      "model": "gpt-4.1-mini",
+      "aliases": ["gpt-4.1-mini-20250115"],
+      "max_context_tokens": 128000,
+      "supports_tool_calling": true,
+      "supports_structured_outputs": true,
+      "reasoning_effort_allowed": ["low", "medium"],
+      "cost": {
+        "input_per_1k_usd": 0.0012,
+        "output_per_1k_usd": 0.004,
+        "blended_per_1k_usd": 0.003
+      },
+      "availability": "ga",
+      "notes": "Lower-cost OpenAI model used in tests and lightweight tasks."
+    },
+    {
+      "provider": "anthropic",
+      "model": "claude-sonnet-4-5",
+      "aliases": ["claude-sonnet-4-5-20250929"],
+      "max_context_tokens": 200000,
+      "supports_tool_calling": true,
+      "supports_structured_outputs": true,
+      "reasoning_effort_allowed": ["low", "medium", "high"],
+      "cost": {
+        "input_per_1k_usd": 0.003,
+        "output_per_1k_usd": 0.01,
+        "blended_per_1k_usd": 0.008
+      },
+      "availability": "ga",
+      "notes": "Balanced Claude model for coding and review workloads."
+    },
+    {
+      "provider": "anthropic",
+      "model": "claude-opus-4-6",
+      "aliases": ["claude-opus-4-6-20260115"],
+      "max_context_tokens": 200000,
+      "supports_tool_calling": true,
+      "supports_structured_outputs": true,
+      "reasoning_effort_allowed": ["medium", "high"],
+      "cost": {
+        "input_per_1k_usd": 0.01,
+        "output_per_1k_usd": 0.03,
+        "blended_per_1k_usd": 0.02
+      },
+      "availability": "ga",
+      "notes": "Higher-cost deep reasoning model for architecture and critical review."
+    },
+    {
+      "provider": "anthropic",
+      "model": "claude-3-7-sonnet",
+      "aliases": ["claude-3-7-sonnet-20250219"],
+      "max_context_tokens": 200000,
+      "supports_tool_calling": true,
+      "supports_structured_outputs": true,
+      "reasoning_effort_allowed": ["low", "medium", "high"],
+      "cost": {
+        "input_per_1k_usd": 0.003,
+        "output_per_1k_usd": 0.015,
+        "blended_per_1k_usd": 0.01
+      },
+      "availability": "legacy",
+      "notes": "Legacy Sonnet entry retained for backwards compatibility in tests."
+    },
+    {
+      "provider": "local",
+      "model": "local-llama-3.1-70b",
+      "aliases": ["llama-3.1-70b"],
+      "max_context_tokens": 8192,
+      "supports_tool_calling": false,
+      "supports_structured_outputs": false,
+      "reasoning_effort_allowed": [],
+      "cost": {
+        "input_per_1k_usd": 0.0,
+        "output_per_1k_usd": 0.0,
+        "blended_per_1k_usd": 0.0
+      },
+      "availability": "experimental",
+      "notes": "Placeholder local profile for offline development paths."
+    }
+  ]
+}

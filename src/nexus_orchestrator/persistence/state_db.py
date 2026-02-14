@@ -22,6 +22,7 @@ Non-functional requirements
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import sqlite3
@@ -31,7 +32,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Final, TypeVar
+from typing import Final, Literal, TypeAlias, TypeVar
 
 from nexus_orchestrator.constants import RISK_TIERS, STATE_DB_SCHEMA_VERSION
 from nexus_orchestrator.domain.models import (
@@ -52,10 +53,13 @@ SQLValue = str | int | float | bytes | None
 SQLParams = Sequence[SQLValue]
 RowValue = str | int | float | bytes | None
 T = TypeVar("T")
+AsyncBlockingPolicy: TypeAlias = Literal["allow", "strict"]
 
 DEFAULT_BUSY_TIMEOUT_MS: Final[int] = 5_000
 DEFAULT_BUSY_RETRY_LIMIT: Final[int] = 4
 DEFAULT_BUSY_RETRY_BACKOFF_MS: Final[int] = 25
+DEFAULT_ASYNC_BLOCKING_POLICY: Final[AsyncBlockingPolicy] = "allow"
+ASYNC_BLOCKING_POLICIES: Final[tuple[AsyncBlockingPolicy, ...]] = ("allow", "strict")
 
 
 def _sql_enum(values: Sequence[str]) -> str:
@@ -264,6 +268,26 @@ _MIGRATION_0001_STATEMENTS: Final[tuple[str, ...]] = (
     "CREATE INDEX IF NOT EXISTS idx_incidents_run_created ON incidents(run_id, created_at DESC)",
 )
 
+_MIGRATION_0002_STATEMENTS: Final[tuple[str, ...]] = (
+    """
+    CREATE TABLE IF NOT EXISTS merge_queue_states (
+        integration_branch TEXT PRIMARY KEY,
+        schema_version INTEGER NOT NULL CHECK (schema_version > 0),
+        next_arrival INTEGER NOT NULL CHECK (next_arrival >= 0),
+        completed_work_items_json TEXT NOT NULL,
+        failed_work_items_json TEXT NOT NULL,
+        queue_json TEXT NOT NULL,
+        imported_from_legacy INTEGER NOT NULL CHECK (imported_from_legacy IN (0, 1)) DEFAULT 0,
+        legacy_state_path TEXT,
+        updated_at TEXT NOT NULL
+    )
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS idx_merge_queue_states_updated
+    ON merge_queue_states(updated_at DESC)
+    """,
+)
+
 
 @dataclass(frozen=True, slots=True)
 class MigrationRecord:
@@ -297,6 +321,12 @@ _MIGRATIONS: Final[tuple[_Migration, ...]] = (
         name="initial_state_schema",
         statements=_MIGRATION_0001_STATEMENTS,
         checksum=_migration_checksum(1, "initial_state_schema", _MIGRATION_0001_STATEMENTS),
+    ),
+    _Migration(
+        version=2,
+        name="merge_queue_state_store",
+        statements=_MIGRATION_0002_STATEMENTS,
+        checksum=_migration_checksum(2, "merge_queue_state_store", _MIGRATION_0002_STATEMENTS),
     ),
 )
 
@@ -350,6 +380,10 @@ class StateDBCorruptionError(StateDBError):
     """Raised when SQLite reports possible corruption."""
 
 
+class StateDBAsyncPolicyError(StateDBError):
+    """Raised when sync DB I/O is attempted from an active async event loop."""
+
+
 class StateDB:
     """SQLite state DB manager with deterministic migrations and safe helpers."""
 
@@ -360,6 +394,7 @@ class StateDB:
         busy_timeout_ms: int = DEFAULT_BUSY_TIMEOUT_MS,
         busy_retry_limit: int = DEFAULT_BUSY_RETRY_LIMIT,
         busy_retry_backoff_ms: int = DEFAULT_BUSY_RETRY_BACKOFF_MS,
+        async_blocking_policy: AsyncBlockingPolicy = DEFAULT_ASYNC_BLOCKING_POLICY,
     ) -> None:
         if busy_timeout_ms < 0:
             raise ValueError("busy_timeout_ms must be >= 0")
@@ -367,20 +402,49 @@ class StateDB:
             raise ValueError("busy_retry_limit must be >= 0")
         if busy_retry_backoff_ms < 0:
             raise ValueError("busy_retry_backoff_ms must be >= 0")
+        if async_blocking_policy not in ASYNC_BLOCKING_POLICIES:
+            allowed = ", ".join(ASYNC_BLOCKING_POLICIES)
+            raise ValueError(
+                f"async_blocking_policy must be one of: {allowed}; got {async_blocking_policy!r}"
+            )
 
         self._path = Path(path).expanduser()
         self._busy_timeout_ms = busy_timeout_ms
         self._busy_retry_limit = busy_retry_limit
         self._busy_retry_backoff_ms = busy_retry_backoff_ms
+        self._async_blocking_policy = async_blocking_policy
         self._savepoint_counter = 0
 
     @property
     def path(self) -> Path:
         return self._path
 
+    @property
+    def async_blocking_policy(self) -> str:
+        return self._async_blocking_policy
+
+    def _is_async_event_loop_thread(self) -> bool:
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            return False
+        return True
+
+    def _assert_sync_io_allowed(self, *, operation: str) -> None:
+        if self._async_blocking_policy != "strict":
+            return
+        if not self._is_async_event_loop_thread():
+            return
+        raise StateDBAsyncPolicyError(
+            f"{operation} is disallowed from an active event loop thread for {self._path}; "
+            "use the async StateDB APIs (e.g. execute_async/query_*_async/migrate_async) "
+            "or offload sync calls via asyncio.to_thread(...)"
+        )
+
     def connect(self) -> sqlite3.Connection:
         """Open a configured SQLite connection for the state DB."""
 
+        self._assert_sync_io_allowed(operation="connect")
         self._path.parent.mkdir(parents=True, exist_ok=True)
         conn = sqlite3.connect(
             self._path,
@@ -394,6 +458,7 @@ class StateDB:
 
     @contextmanager
     def connection(self) -> Iterator[sqlite3.Connection]:
+        self._assert_sync_io_allowed(operation="connection")
         conn = self.connect()
         try:
             yield conn
@@ -409,6 +474,7 @@ class StateDB:
     ) -> Iterator[sqlite3.Connection]:
         """Run statements inside an atomic transaction with savepoint support."""
 
+        self._assert_sync_io_allowed(operation="transaction")
         if conn is None:
             with self.connection() as owned_conn:
                 with self.transaction(conn=owned_conn, immediate=immediate) as txn_conn:
@@ -456,6 +522,7 @@ class StateDB:
     def migrate(self) -> int:
         """Apply migrations idempotently and return current schema version."""
 
+        self._assert_sync_io_allowed(operation="migrate")
         self._validate_migration_chain(STATE_DB_SCHEMA_VERSION)
         with self.connection() as conn:
             self._execute_with_retry(
@@ -527,7 +594,12 @@ class StateDB:
 
         return self.migrate()
 
+    async def migrate_async(self) -> int:
+        return await asyncio.to_thread(self.migrate)
+
     def schema_version(self, *, conn: sqlite3.Connection | None = None) -> int:
+        if conn is None:
+            self._assert_sync_io_allowed(operation="schema_version")
         row = self.query_one(
             "SELECT COALESCE(MAX(version), 0) AS version FROM schema_versions",
             conn=conn,
@@ -540,6 +612,7 @@ class StateDB:
         return value
 
     def schema_history(self) -> list[MigrationRecord]:
+        self._assert_sync_io_allowed(operation="schema_history")
         rows = self.query_all(
             """
             SELECT version, name, checksum, applied_at
@@ -580,6 +653,7 @@ class StateDB:
     ) -> int:
         """Execute a parameterized statement and return affected row count."""
 
+        self._assert_sync_io_allowed(operation="execute")
         if conn is not None:
             cursor = self._execute_with_retry(conn, sql, params, operation="execute statement")
             return cursor.rowcount
@@ -597,6 +671,7 @@ class StateDB:
     ) -> int:
         """Execute a parameterized statement for a sequence of parameter tuples."""
 
+        self._assert_sync_io_allowed(operation="executemany")
         params_list = [tuple(params) for params in params_iter]
         if conn is not None:
             return self._executemany_with_retry(conn, sql, params_list, operation="execute many")
@@ -613,6 +688,7 @@ class StateDB:
     ) -> list[dict[str, RowValue]]:
         """Run a query and return rows as typed dictionaries."""
 
+        self._assert_sync_io_allowed(operation="query_all")
         if conn is not None:
             cursor = self._execute_with_retry(conn, sql, params, operation="query all")
             return [_row_to_dict(row) for row in cursor.fetchall()]
@@ -630,6 +706,7 @@ class StateDB:
     ) -> dict[str, RowValue] | None:
         """Run a query and return the first row as a typed dictionary."""
 
+        self._assert_sync_io_allowed(operation="query_one")
         if conn is not None:
             cursor = self._execute_with_retry(conn, sql, params, operation="query one")
             row = cursor.fetchone()
@@ -639,6 +716,27 @@ class StateDB:
             cursor = self._execute_with_retry(owned_conn, sql, params, operation="query one")
             row = cursor.fetchone()
             return None if row is None else _row_to_dict(row)
+
+    async def execute_async(self, sql: str, params: SQLParams = ()) -> int:
+        return await asyncio.to_thread(self.execute, sql, tuple(params))
+
+    async def executemany_async(self, sql: str, params_iter: Iterable[SQLParams]) -> int:
+        params_list = [tuple(params) for params in params_iter]
+        return await asyncio.to_thread(self.executemany, sql, params_list)
+
+    async def query_all_async(
+        self,
+        sql: str,
+        params: SQLParams = (),
+    ) -> list[dict[str, RowValue]]:
+        return await asyncio.to_thread(self.query_all, sql, tuple(params))
+
+    async def query_one_async(
+        self,
+        sql: str,
+        params: SQLParams = (),
+    ) -> dict[str, RowValue] | None:
+        return await asyncio.to_thread(self.query_one, sql, tuple(params))
 
     def record_run_metadata(
         self,
@@ -656,6 +754,7 @@ class StateDB:
     ) -> None:
         """Record run metadata via idempotent upsert for failure-safe bookkeeping."""
 
+        self._assert_sync_io_allowed(operation="record_run_metadata")
         if status not in _RUN_STATUS_VALUES:
             raise ValueError(f"unsupported run status: {status}")
         if risk_tier not in RISK_TIERS:
@@ -740,6 +839,7 @@ class StateDB:
     ) -> None:
         """Record incident metadata via idempotent upsert for failure-safe bookkeeping."""
 
+        self._assert_sync_io_allowed(operation="record_incident")
         incident_payload = (
             {"id": incident_id, "run_id": run_id, "category": category, "message": message}
             if payload is None
@@ -776,9 +876,60 @@ class StateDB:
             ),
         )
 
+    async def record_run_metadata_async(
+        self,
+        *,
+        run_id: str,
+        spec_path: str,
+        status: str,
+        started_at: str,
+        config_hash: str,
+        risk_tier: str = "medium",
+        budget: object | None = None,
+        metadata: object | None = None,
+        work_item_ids: Sequence[str] = (),
+        finished_at: str | None = None,
+    ) -> None:
+        await asyncio.to_thread(
+            self.record_run_metadata,
+            run_id=run_id,
+            spec_path=spec_path,
+            status=status,
+            started_at=started_at,
+            config_hash=config_hash,
+            risk_tier=risk_tier,
+            budget=budget,
+            metadata=metadata,
+            work_item_ids=work_item_ids,
+            finished_at=finished_at,
+        )
+
+    async def record_incident_async(
+        self,
+        *,
+        incident_id: str,
+        run_id: str,
+        category: str,
+        message: str,
+        related_work_item_id: str | None = None,
+        created_at: str | None = None,
+        payload: object | None = None,
+    ) -> None:
+        await asyncio.to_thread(
+            self.record_incident,
+            incident_id=incident_id,
+            run_id=run_id,
+            category=category,
+            message=message,
+            related_work_item_id=related_work_item_id,
+            created_at=created_at,
+            payload=payload,
+        )
+
     def backup(self, destination: str | Path) -> Path:
         """Create a consistent snapshot using SQLite backup API."""
 
+        self._assert_sync_io_allowed(operation="backup")
         destination_path = Path(destination).expanduser()
         destination_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -801,6 +952,7 @@ class StateDB:
     def integrity_check(self, *, max_errors: int = 100) -> tuple[str, ...]:
         """Return integrity-check errors; empty tuple means OK."""
 
+        self._assert_sync_io_allowed(operation="integrity_check")
         if max_errors <= 0:
             raise ValueError("max_errors must be > 0")
         rows = self.query_all(f"PRAGMA integrity_check({max_errors})")
@@ -961,6 +1113,8 @@ def canonical_json(value: object) -> str:
 
 
 __all__ = [
+    "ASYNC_BLOCKING_POLICIES",
+    "DEFAULT_ASYNC_BLOCKING_POLICY",
     "DEFAULT_BUSY_RETRY_BACKOFF_MS",
     "DEFAULT_BUSY_RETRY_LIMIT",
     "DEFAULT_BUSY_TIMEOUT_MS",
@@ -972,6 +1126,7 @@ __all__ = [
     "StateDBBusyError",
     "StateDBCorruptionError",
     "StateDBError",
+    "StateDBAsyncPolicyError",
     "StateDBMigrationError",
     "canonical_json",
 ]

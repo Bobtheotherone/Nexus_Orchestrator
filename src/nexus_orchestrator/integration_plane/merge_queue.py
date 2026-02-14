@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Final, TypeAlias, cast
 
 from nexus_orchestrator.domain import RiskTier
+from nexus_orchestrator.persistence.state_db import StateDB, canonical_json
 
 if TYPE_CHECKING:
     from enum import StrEnum
@@ -28,6 +29,8 @@ JSONScalar: TypeAlias = str | int | float | bool | None
 JSONValue: TypeAlias = JSONScalar | list["JSONValue"] | dict[str, "JSONValue"]
 
 _STATE_SCHEMA_VERSION: Final[int] = 1
+_STATE_DB_TABLE: Final[str] = "merge_queue_states"
+_DEFAULT_STATE_DB_SUFFIX: Final[str] = ".sqlite3"
 _REQUIRED_STATE_KEYS: Final[tuple[str, ...]] = (
     "schema_version",
     "next_arrival",
@@ -240,15 +243,30 @@ class _CompositionalOutcome:
 
 
 class MergeQueue:
-    """Deterministic file-backed merge queue with serialized processing."""
+    """Deterministic DB-backed merge queue with serialized processing."""
 
-    def __init__(self, state_file: str | Path, *, integration_branch: str = "integration") -> None:
+    def __init__(
+        self,
+        state_file: str | Path,
+        *,
+        integration_branch: str = "integration",
+        state_db: StateDB | str | Path | None = None,
+    ) -> None:
         integration = _normalize_identifier(
             integration_branch,
             field_name="MergeQueue.integration_branch",
         )
+        resolved_state_file = Path(state_file).expanduser().resolve()
         self._integration_branch = integration
-        self._state_file = Path(state_file).expanduser().resolve()
+        self._legacy_state_file = _coerce_legacy_state_file(
+            state_file=resolved_state_file,
+            explicit_state_db=state_db is not None,
+        )
+        self._state_db = _coerce_state_db(
+            state_db=state_db,
+            state_file=resolved_state_file,
+        )
+        self._state_db.migrate()
         self._queue: list[QueueCandidate] = []
         self._completed_work_items: set[str] = set()
         self._failed_work_items: set[str] = set()
@@ -258,13 +276,21 @@ class MergeQueue:
 
     @classmethod
     def from_json_file(
-        cls, state_file: str | Path, *, integration_branch: str = "integration"
+        cls,
+        state_file: str | Path,
+        *,
+        integration_branch: str = "integration",
+        state_db: StateDB | str | Path | None = None,
     ) -> MergeQueue:
-        return cls(state_file, integration_branch=integration_branch)
+        return cls(state_file, integration_branch=integration_branch, state_db=state_db)
 
     @property
     def integration_branch(self) -> str:
         return self._integration_branch
+
+    @property
+    def state_db_path(self) -> Path:
+        return self._state_db.path
 
     @property
     def pending_candidates(self) -> tuple[QueueCandidate, ...]:
@@ -295,7 +321,7 @@ class MergeQueue:
         self._next_arrival = max(self._next_arrival, normalized.arrival + 1)
 
         self._queue.append(normalized)
-        self._persist_state()
+        self._persist_state_sync(imported_from_legacy=False)
         return normalized
 
     def enqueue_candidate(self, candidate: QueueCandidate) -> QueueCandidate:
@@ -322,7 +348,7 @@ class MergeQueue:
             rebase_outcome = await self._perform_rebase(git_engine, candidate)
             if not rebase_outcome.success:
                 self._mark_failed(candidate.work_item_id)
-                self._persist_state()
+                await self._persist_state_async(imported_from_legacy=False)
                 result = MergeResult(
                     status=MergeStatus.FAILED,
                     candidate=candidate,
@@ -357,7 +383,7 @@ class MergeQueue:
 
                 if compositional_outcome.requeue:
                     requeued_candidate = self._requeue(candidate)
-                    self._persist_state()
+                    await self._persist_state_async(imported_from_legacy=False)
                     result = MergeResult(
                         status=MergeStatus.REQUEUED,
                         candidate=requeued_candidate,
@@ -369,7 +395,7 @@ class MergeQueue:
                     )
                 else:
                     self._mark_failed(candidate.work_item_id)
-                    self._persist_state()
+                    await self._persist_state_async(imported_from_legacy=False)
                     result = MergeResult(
                         status=MergeStatus.FAILED,
                         candidate=candidate,
@@ -399,7 +425,7 @@ class MergeQueue:
                 )
 
                 self._mark_failed(candidate.work_item_id)
-                self._persist_state()
+                await self._persist_state_async(imported_from_legacy=False)
                 result = MergeResult(
                     status=MergeStatus.FAILED,
                     candidate=candidate,
@@ -414,7 +440,7 @@ class MergeQueue:
 
             self._mark_merged(candidate.work_item_id)
             integration_head_after = await self._read_integration_head(git_engine)
-            self._persist_state()
+            await self._persist_state_async(imported_from_legacy=False)
 
             result = MergeResult(
                 status=MergeStatus.MERGED,
@@ -597,31 +623,90 @@ class MergeQueue:
             await _maybe_await(hook_candidate(result))
 
     def _load_state(self) -> None:
-        if not self._state_file.exists():
+        parsed = self._load_state_payload_from_db()
+        if parsed is not None:
+            self._apply_state_payload(parsed)
             return
 
+        legacy_payload = self._load_legacy_state_payload()
+        if legacy_payload is None:
+            return
+
+        self._apply_state_payload(legacy_payload)
+        self._persist_state_sync(imported_from_legacy=True)
+
+    def _load_state_payload_from_db(self) -> dict[str, object] | None:
+        row = self._state_db.query_one(
+            f"""
+            SELECT
+                schema_version,
+                next_arrival,
+                completed_work_items_json,
+                failed_work_items_json,
+                queue_json
+            FROM {_STATE_DB_TABLE}
+            WHERE integration_branch = ?
+            """,
+            (self._integration_branch,),
+        )
+        if row is None:
+            return None
+
+        schema_version = row.get("schema_version")
+        next_arrival = row.get("next_arrival")
+        completed_raw = row.get("completed_work_items_json")
+        failed_raw = row.get("failed_work_items_json")
+        queue_raw = row.get("queue_json")
+
+        if not isinstance(schema_version, int):
+            raise MergeQueueStateError("MergeQueue DB state schema_version must be integer")
+        if not isinstance(next_arrival, int):
+            raise MergeQueueStateError("MergeQueue DB state next_arrival must be integer")
+        if not isinstance(completed_raw, str):
+            raise MergeQueueStateError("MergeQueue DB state completed_work_items_json must be text")
+        if not isinstance(failed_raw, str):
+            raise MergeQueueStateError("MergeQueue DB state failed_work_items_json must be text")
+        if not isinstance(queue_raw, str):
+            raise MergeQueueStateError("MergeQueue DB state queue_json must be text")
+
         try:
-            payload_raw = self._state_file.read_text(encoding="utf-8")
+            completed = json.loads(completed_raw)
+            failed = json.loads(failed_raw)
+            queue = json.loads(queue_raw)
+        except json.JSONDecodeError as exc:
+            raise MergeQueueStateError(f"invalid JSON in MergeQueue DB state: {exc}") from exc
+
+        return {
+            "schema_version": schema_version,
+            "next_arrival": next_arrival,
+            "completed_work_items": completed,
+            "failed_work_items": failed,
+            "queue": queue,
+        }
+
+    def _load_legacy_state_payload(self) -> dict[str, object] | None:
+        if self._legacy_state_file is None:
+            return None
+        if not self._legacy_state_file.exists():
+            return None
+
+        try:
+            payload_raw = self._legacy_state_file.read_text(encoding="utf-8")
         except OSError as exc:
             raise MergeQueueStateError(
-                f"failed to read MergeQueue state file {self._state_file}: {exc}"
+                f"failed to read MergeQueue state file {self._legacy_state_file}: {exc}"
             ) from exc
 
         try:
             parsed = json.loads(payload_raw)
         except json.JSONDecodeError as exc:
             raise MergeQueueStateError(
-                f"invalid JSON in MergeQueue state file {self._state_file}: {exc.msg}"
+                f"invalid JSON in MergeQueue state file {self._legacy_state_file}: {exc.msg}"
             ) from exc
 
-        try:
-            self._apply_state_payload(parsed)
-        except MergeQueueStateError:
-            raise
-        except (TypeError, ValueError, KeyError) as exc:
-            raise MergeQueueStateError(
-                f"invalid MergeQueue state file {self._state_file}: {exc}"
-            ) from exc
+        if not isinstance(parsed, dict):
+            raise MergeQueueStateError("MergeQueue state file root must be an object")
+        return {str(key): value for key, value in parsed.items() if isinstance(key, str)}
 
     def _apply_state_payload(self, parsed: object) -> None:
         if not isinstance(parsed, dict):
@@ -687,8 +772,8 @@ class MergeQueue:
         self._failed_work_items = failed
         self._next_arrival = max(next_arrival, max_arrival + 1)
 
-    def _persist_state(self) -> None:
-        payload = {
+    def _state_payload(self) -> dict[str, object]:
+        return {
             "schema_version": _STATE_SCHEMA_VERSION,
             "next_arrival": self._next_arrival,
             "completed_work_items": sorted(self._completed_work_items),
@@ -701,13 +786,145 @@ class MergeQueue:
             ],
         }
 
-        self._state_file.parent.mkdir(parents=True, exist_ok=True)
-        tmp_state_file = self._state_file.with_suffix(f"{self._state_file.suffix}.tmp")
-        tmp_state_file.write_text(
-            json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False) + "\n",
-            encoding="utf-8",
+    def _persist_state_sync(self, *, imported_from_legacy: bool) -> None:
+        payload = self._state_payload()
+        schema_version = _expect_int(payload["schema_version"], field_name="schema_version")
+        next_arrival = _expect_int(payload["next_arrival"], field_name="next_arrival")
+        completed_json = canonical_json(payload["completed_work_items"])
+        failed_json = canonical_json(payload["failed_work_items"])
+        queue_json = canonical_json(payload["queue"])
+        legacy_path = (
+            str(self._legacy_state_file)
+            if imported_from_legacy and self._legacy_state_file is not None
+            else None
         )
-        tmp_state_file.replace(self._state_file)
+        try:
+            self._state_db.execute(
+                f"""
+                INSERT INTO {_STATE_DB_TABLE} (
+                    integration_branch,
+                    schema_version,
+                    next_arrival,
+                    completed_work_items_json,
+                    failed_work_items_json,
+                    queue_json,
+                    imported_from_legacy,
+                    legacy_state_path,
+                    updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+                ON CONFLICT(integration_branch) DO UPDATE SET
+                    schema_version=excluded.schema_version,
+                    next_arrival=excluded.next_arrival,
+                    completed_work_items_json=excluded.completed_work_items_json,
+                    failed_work_items_json=excluded.failed_work_items_json,
+                    queue_json=excluded.queue_json,
+                    imported_from_legacy=
+                        CASE
+                            WHEN {_STATE_DB_TABLE}.imported_from_legacy = 1 THEN 1
+                            ELSE excluded.imported_from_legacy
+                        END,
+                    legacy_state_path=
+                        CASE
+                            WHEN {_STATE_DB_TABLE}.legacy_state_path IS NOT NULL
+                                THEN {_STATE_DB_TABLE}.legacy_state_path
+                            ELSE excluded.legacy_state_path
+                        END,
+                    updated_at=excluded.updated_at
+                """,
+                (
+                    self._integration_branch,
+                    schema_version,
+                    next_arrival,
+                    completed_json,
+                    failed_json,
+                    queue_json,
+                    1 if imported_from_legacy else 0,
+                    legacy_path,
+                ),
+            )
+        except Exception as exc:
+            raise MergeQueueStateError(f"failed to persist MergeQueue state: {exc}") from exc
+
+    async def _persist_state_async(self, *, imported_from_legacy: bool) -> None:
+        payload = self._state_payload()
+        schema_version = _expect_int(payload["schema_version"], field_name="schema_version")
+        next_arrival = _expect_int(payload["next_arrival"], field_name="next_arrival")
+        completed_json = canonical_json(payload["completed_work_items"])
+        failed_json = canonical_json(payload["failed_work_items"])
+        queue_json = canonical_json(payload["queue"])
+        legacy_path = (
+            str(self._legacy_state_file)
+            if imported_from_legacy and self._legacy_state_file is not None
+            else None
+        )
+        try:
+            await self._state_db.execute_async(
+                f"""
+                INSERT INTO {_STATE_DB_TABLE} (
+                    integration_branch,
+                    schema_version,
+                    next_arrival,
+                    completed_work_items_json,
+                    failed_work_items_json,
+                    queue_json,
+                    imported_from_legacy,
+                    legacy_state_path,
+                    updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+                ON CONFLICT(integration_branch) DO UPDATE SET
+                    schema_version=excluded.schema_version,
+                    next_arrival=excluded.next_arrival,
+                    completed_work_items_json=excluded.completed_work_items_json,
+                    failed_work_items_json=excluded.failed_work_items_json,
+                    queue_json=excluded.queue_json,
+                    imported_from_legacy=
+                        CASE
+                            WHEN {_STATE_DB_TABLE}.imported_from_legacy = 1 THEN 1
+                            ELSE excluded.imported_from_legacy
+                        END,
+                    legacy_state_path=
+                        CASE
+                            WHEN {_STATE_DB_TABLE}.legacy_state_path IS NOT NULL
+                                THEN {_STATE_DB_TABLE}.legacy_state_path
+                            ELSE excluded.legacy_state_path
+                        END,
+                    updated_at=excluded.updated_at
+                """,
+                (
+                    self._integration_branch,
+                    schema_version,
+                    next_arrival,
+                    completed_json,
+                    failed_json,
+                    queue_json,
+                    1 if imported_from_legacy else 0,
+                    legacy_path,
+                ),
+            )
+        except Exception as exc:
+            raise MergeQueueStateError(f"failed to persist MergeQueue state: {exc}") from exc
+
+
+def _coerce_state_db(
+    *,
+    state_db: StateDB | str | Path | None,
+    state_file: Path,
+) -> StateDB:
+    if isinstance(state_db, StateDB):
+        return state_db
+    if state_db is None:
+        if state_file.suffix.lower() in {".sqlite", ".sqlite3", ".db"}:
+            return StateDB(state_file)
+        return StateDB(state_file.with_suffix(_DEFAULT_STATE_DB_SUFFIX))
+    return StateDB(Path(state_db).expanduser().resolve())
+
+
+def _coerce_legacy_state_file(*, state_file: Path, explicit_state_db: bool) -> Path | None:
+    if explicit_state_db:
+        return state_file if state_file.suffix.lower() == ".json" else None
+    if state_file.suffix.lower() in {".sqlite", ".sqlite3", ".db"}:
+        return None
+    return state_file
 
 
 def _normalize_compositional_outcome(raw_outcome: object) -> _CompositionalOutcome:
