@@ -18,8 +18,8 @@
 // - Must not include secrets or environment-specific values.
 // - Preserve backward-compatible aliases required by tests and configs.
 {
-  "version": "2026.02.13",
-  "last_updated": "2026-02-13",
+  "version": "2026.02.14",
+  "last_updated": "2026-02-14",
   "default_profiles": {
     "openai": {
       "code": "gpt-5-codex",
@@ -35,6 +35,11 @@
       "code": "local-llama-3.1-70b",
       "architect": "local-llama-3.1-70b",
       "review": "local-llama-3.1-70b"
+    },
+    "tool": {
+      "code": "codex_cli",
+      "architect": "claude_code",
+      "review": "claude_code"
     }
   },
   "models": [
@@ -165,6 +170,38 @@
       },
       "availability": "experimental",
       "notes": "Placeholder local profile for offline development paths."
+    },
+    {
+      "provider": "tool",
+      "model": "codex_cli",
+      "aliases": ["codex-cli"],
+      "max_context_tokens": 128000,
+      "supports_tool_calling": false,
+      "supports_structured_outputs": false,
+      "reasoning_effort_allowed": [],
+      "cost": {
+        "input_per_1k_usd": 0.0,
+        "output_per_1k_usd": 0.0,
+        "blended_per_1k_usd": 0.0
+      },
+      "availability": "experimental",
+      "notes": "OpenAI Codex CLI backend (subscription-based, no API key)."
+    },
+    {
+      "provider": "tool",
+      "model": "claude_code",
+      "aliases": ["claude-code"],
+      "max_context_tokens": 200000,
+      "supports_tool_calling": false,
+      "supports_structured_outputs": false,
+      "reasoning_effort_allowed": [],
+      "cost": {
+        "input_per_1k_usd": 0.0,
+        "output_per_1k_usd": 0.0,
+        "blended_per_1k_usd": 0.0
+      },
+      "availability": "experimental",
+      "notes": "Claude Code CLI backend (subscription-based, no API key)."
     }
   ]
 }

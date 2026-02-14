@@ -291,3 +291,331 @@ def test_cli_plan_run_status_subprocess_contract(tmp_path: Path) -> None:
                 failures.append(f"status output missing completed state:\n{status_result.stdout}")
 
     assert not failures, "\n\n".join(failures)
+
+
+# ---------------------------------------------------------------------------
+# New CLI commands and UX tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.integration
+def test_cli_doctor_exits_zero(tmp_path: Path) -> None:
+    """Doctor command must exit 0 and produce diagnostic output."""
+
+    repo_root, _ = _prepare_workspace(tmp_path)
+    result = _run_cli(repo_root, "doctor")
+    assert result.returncode == 0, _render_failure("doctor", result)
+    stdout = result.stdout.lower()
+    assert "config" in stdout, f"doctor output missing config check:\n{result.stdout}"
+    assert "git" in stdout, f"doctor output missing git check:\n{result.stdout}"
+
+
+@pytest.mark.integration
+def test_cli_doctor_json_has_checks(tmp_path: Path) -> None:
+    """Doctor --json must produce parseable JSON with checks array."""
+
+    repo_root, _ = _prepare_workspace(tmp_path)
+    result = _run_cli(repo_root, "doctor", "--json")
+    assert result.returncode == 0, _render_failure("doctor --json", result)
+    payload = json.loads(result.stdout)
+    assert payload["command"] == "doctor"
+    assert isinstance(payload["checks"], list)
+    assert len(payload["checks"]) > 0
+    check_names = {check["name"] for check in payload["checks"]}
+    assert "config" in check_names
+    assert "git" in check_names
+
+
+@pytest.mark.integration
+def test_cli_config_shows_redacted_config(tmp_path: Path) -> None:
+    """Config command must exit 0 and print effective config (redacted)."""
+
+    repo_root, _ = _prepare_workspace(tmp_path)
+    result = _run_cli(repo_root, "config")
+    assert result.returncode == 0, _render_failure("config", result)
+    assert "profile" in result.stdout.lower(), f"config output missing profile:\n{result.stdout}"
+
+
+@pytest.mark.integration
+def test_cli_config_json_has_stable_keys(tmp_path: Path) -> None:
+    """Config --json must produce parseable JSON with expected keys."""
+
+    repo_root, _ = _prepare_workspace(tmp_path)
+    result = _run_cli(repo_root, "config", "--json")
+    assert result.returncode == 0, _render_failure("config --json", result)
+    payload = json.loads(result.stdout)
+    assert payload["command"] == "config"
+    assert "config" in payload
+    assert "active_profile" in payload
+
+
+@pytest.mark.integration
+def test_cli_completion_bash(tmp_path: Path) -> None:
+    """Completion command must produce a shell script for bash."""
+
+    repo_root, _ = _prepare_workspace(tmp_path)
+    result = _run_cli(repo_root, "completion", "bash")
+    assert result.returncode == 0, _render_failure("completion bash", result)
+    assert "complete" in result.stdout.lower(), "completion bash must produce a completion script"
+    assert "nexus" in result.stdout, "completion must reference the nexus command"
+
+
+@pytest.mark.integration
+def test_cli_completion_zsh(tmp_path: Path) -> None:
+    """Completion command must produce a shell script for zsh."""
+
+    repo_root, _ = _prepare_workspace(tmp_path)
+    result = _run_cli(repo_root, "completion", "zsh")
+    assert result.returncode == 0, _render_failure("completion zsh", result)
+    assert "compdef" in result.stdout, "completion zsh must produce a zsh completion script"
+
+
+@pytest.mark.integration
+def test_cli_plan_json_has_stable_keys(tmp_path: Path) -> None:
+    """Plan --json must produce parseable JSON with required keys."""
+
+    repo_root, _ = _prepare_workspace(tmp_path)
+    result = _run_cli(repo_root, "plan", "samples/specs/minimal_design_doc.md", "--json")
+    assert result.returncode == 0, _render_failure("plan --json", result)
+    payload = json.loads(result.stdout)
+    assert payload["command"] == "plan"
+    assert isinstance(payload["work_items"], list)
+    assert "warnings" in payload
+    assert "errors" in payload
+    assert "task_graph" in payload
+    assert "spec_path" in payload
+
+
+@pytest.mark.integration
+def test_cli_plan_shows_next_steps(tmp_path: Path) -> None:
+    """Plan human output must include Next steps hint."""
+
+    repo_root, _ = _prepare_workspace(tmp_path)
+    result = _run_cli(repo_root, "plan", "samples/specs/minimal_design_doc.md")
+    assert result.returncode == 0, _render_failure("plan", result)
+    assert "next steps" in result.stdout.lower(), f"plan missing next steps:\n{result.stdout}"
+    assert "nexus run" in result.stdout, f"plan next steps missing run hint:\n{result.stdout}"
+
+
+@pytest.mark.integration
+def test_cli_plan_shows_work_item_table(tmp_path: Path) -> None:
+    """Plan human output must include a work-item table."""
+
+    repo_root, _ = _prepare_workspace(tmp_path)
+    result = _run_cli(repo_root, "plan", "samples/specs/minimal_design_doc.md")
+    assert result.returncode == 0, _render_failure("plan", result)
+    stdout = result.stdout
+    assert "TITLE" in stdout or "title" in stdout.lower(), f"plan missing table header:\n{stdout}"
+    assert "RISK" in stdout or "risk" in stdout.lower(), f"plan missing risk column:\n{stdout}"
+
+
+@pytest.mark.integration
+def test_cli_run_shows_next_steps(tmp_path: Path) -> None:
+    """Run human output must include Next steps hint."""
+
+    repo_root, _ = _prepare_workspace(tmp_path)
+    result = _run_cli(repo_root, "run", "samples/specs/minimal_design_doc.md", "--mock")
+    assert result.returncode == 0, _render_failure("run --mock", result)
+    assert "next steps" in result.stdout.lower(), f"run missing next steps:\n{result.stdout}"
+    assert "nexus status" in result.stdout, f"run next steps missing status hint:\n{result.stdout}"
+
+
+@pytest.mark.integration
+def test_cli_status_json_has_routing_and_warnings(tmp_path: Path) -> None:
+    """Status --json must include routing_ladder and model_catalog_warnings."""
+
+    repo_root, _ = _prepare_workspace(tmp_path)
+    _run_cli(repo_root, "run", "samples/specs/minimal_design_doc.md", "--mock")
+    result = _run_cli(repo_root, "status", "--json")
+    assert result.returncode == 0, _render_failure("status --json", result)
+    payload = json.loads(result.stdout)
+    assert "routing_ladder" in payload, "status JSON must include routing_ladder"
+    assert isinstance(payload["routing_ladder"], list)
+    assert "model_catalog_warnings" in payload, "status JSON must include model_catalog_warnings"
+    if payload["routing_ladder"]:
+        first_role = payload["routing_ladder"][0]
+        assert "role" in first_role
+        assert "steps" in first_role
+
+
+@pytest.mark.integration
+def test_cli_inspect_json_has_routing_and_warnings(tmp_path: Path) -> None:
+    """Inspect --json must include routing_ladder and model_catalog_warnings."""
+
+    repo_root, _ = _prepare_workspace(tmp_path)
+    _run_cli(repo_root, "run", "samples/specs/minimal_design_doc.md", "--mock")
+    result = _run_cli(repo_root, "inspect", "--json")
+    assert result.returncode == 0, _render_failure("inspect --json", result)
+    payload = json.loads(result.stdout)
+    assert "routing_ladder" in payload, "inspect JSON must include routing_ladder"
+    assert "model_catalog_warnings" in payload, "inspect JSON must include model_catalog_warnings"
+
+
+@pytest.mark.integration
+def test_cli_clean_dry_run_is_non_destructive(tmp_path: Path) -> None:
+    """Clean with no flags must perform auto-dry-run and not delete anything."""
+
+    repo_root, _ = _prepare_workspace(tmp_path)
+    _run_cli(repo_root, "run", "samples/specs/minimal_design_doc.md", "--mock")
+    state_db = repo_root / "state" / "nexus.sqlite"
+    assert state_db.exists(), "state DB must exist before clean"
+    result = _run_cli(repo_root, "clean")
+    assert result.returncode == 0, _render_failure("clean", result)
+    assert "dry-run" in result.stdout.lower(), (
+        f"clean without flags must be dry-run:\n{result.stdout}"
+    )
+    assert state_db.exists(), "clean without explicit flags must NOT delete state DB"
+
+
+@pytest.mark.integration
+def test_cli_clean_explicit_dry_run_flag(tmp_path: Path) -> None:
+    """Clean --dry-run must not delete anything."""
+
+    repo_root, _ = _prepare_workspace(tmp_path)
+    _run_cli(repo_root, "run", "samples/specs/minimal_design_doc.md", "--mock")
+    state_db = repo_root / "state" / "nexus.sqlite"
+    assert state_db.exists()
+    result = _run_cli(repo_root, "clean", "--dry-run")
+    assert result.returncode == 0, _render_failure("clean --dry-run", result)
+    assert state_db.exists(), "clean --dry-run must NOT delete state DB"
+
+
+@pytest.mark.integration
+def test_cli_clean_explicit_flags_actually_delete(tmp_path: Path) -> None:
+    """Clean --workspaces must actually remove the workspaces directory."""
+
+    repo_root, _ = _prepare_workspace(tmp_path)
+    _run_cli(repo_root, "run", "samples/specs/minimal_design_doc.md", "--mock")
+    workspaces = repo_root / "workspaces"
+    assert workspaces.exists(), "workspaces must exist after run"
+    result = _run_cli(repo_root, "clean", "--workspaces")
+    assert result.returncode == 0, _render_failure("clean --workspaces", result)
+    assert not workspaces.exists(), "clean --workspaces must delete workspaces directory"
+    state_db = repo_root / "state" / "nexus.sqlite"
+    assert state_db.exists(), "clean --workspaces must NOT delete state DB (not selected)"
+
+
+@pytest.mark.integration
+def test_cli_clean_json_has_stable_keys(tmp_path: Path) -> None:
+    """Clean --json must produce parseable JSON with expected keys."""
+
+    repo_root, _ = _prepare_workspace(tmp_path)
+    result = _run_cli(repo_root, "clean", "--json")
+    assert result.returncode == 0, _render_failure("clean --json", result)
+    payload = json.loads(result.stdout)
+    assert payload["command"] == "clean"
+    assert "dry_run" in payload
+    assert "removed" in payload
+    assert "missing" in payload
+    assert "errors" in payload
+
+
+@pytest.mark.integration
+def test_cli_help_includes_new_commands(tmp_path: Path) -> None:
+    """--help must list doctor, config, and completion commands."""
+
+    repo_root, _ = _prepare_workspace(tmp_path)
+    result = _run_cli(repo_root, "--help")
+    assert result.returncode == 0, _render_failure("--help", result)
+    stdout = result.stdout.lower()
+    assert "doctor" in stdout, "--help missing doctor command"
+    assert "config" in stdout, "--help missing config command"
+    assert "completion" in stdout, "--help missing completion command"
+
+
+@pytest.mark.integration
+def test_cli_routing_ladder_not_hardcoded(tmp_path: Path) -> None:
+    """Routing ladder in status must be derived from config + model catalog, not hard-coded."""
+
+    repo_root, _ = _prepare_workspace(tmp_path)
+    _run_cli(repo_root, "run", "samples/specs/minimal_design_doc.md", "--mock")
+    result = _run_cli(repo_root, "status", "--json")
+    assert result.returncode == 0, _render_failure("status --json", result)
+    payload = json.loads(result.stdout)
+    ladder = payload.get("routing_ladder", [])
+    assert len(ladder) > 0, "routing ladder must have roles"
+    for role_entry in ladder:
+        steps = role_entry.get("steps", [])
+        for step in steps:
+            assert "provider" in step, f"step missing provider: {step}"
+            assert "model" in step, f"step missing model: {step}"
+            assert step["provider"] and step["model"], f"empty provider/model in step: {step}"
+
+
+@pytest.mark.integration
+def test_cli_tui_missing_deps_exit_code(tmp_path: Path) -> None:
+    """nexus tui returns exit code 2 with install hint when textual is missing."""
+
+    repo_root, _ = _prepare_workspace(tmp_path)
+    # Force textual to be "not found" by running in a subprocess that hides it
+    env = os.environ.copy()
+    existing_pythonpath = env.get("PYTHONPATH")
+    src_pythonpath = str(SRC_PATH)
+    env["PYTHONPATH"] = (
+        src_pythonpath if not existing_pythonpath else f"{src_pythonpath}:{existing_pythonpath}"
+    )
+    env.setdefault("GIT_TERMINAL_PROMPT", "0")
+    env.setdefault("GIT_CONFIG_NOSYSTEM", "1")
+    # Run with a script that patches find_spec to hide textual
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import importlib.util, unittest.mock, sys; "
+                "orig = importlib.util.find_spec; "
+                "unittest.mock.patch("
+                "'importlib.util.find_spec', "
+                "side_effect=lambda name, *a, **k: None if name == 'textual' else orig(name, *a, **k)"
+                ").start(); "
+                "from nexus_orchestrator.ui.tui import run_tui; "
+                "sys.exit(run_tui())"
+            ),
+        ],
+        cwd=repo_root,
+        text=True,
+        capture_output=True,
+        check=False,
+        env=env,
+    )
+    assert result.returncode == 2, _render_failure("tui (no textual)", result)
+    assert "install" in result.stderr.lower(), (
+        f"tui missing-deps message must mention install:\n{result.stderr}"
+    )
+
+
+@pytest.mark.integration
+def test_cli_tui_help(tmp_path: Path) -> None:
+    """nexus tui --help must work and show TUI description."""
+
+    repo_root, _ = _prepare_workspace(tmp_path)
+    result = _run_cli(repo_root, "tui", "--help")
+    assert result.returncode == 0, _render_failure("tui --help", result)
+    stdout = result.stdout.lower()
+    assert "tui" in stdout, "--help missing tui reference"
+
+
+@pytest.mark.integration
+def test_cli_help_includes_tui(tmp_path: Path) -> None:
+    """--help must list the tui command."""
+
+    repo_root, _ = _prepare_workspace(tmp_path)
+    result = _run_cli(repo_root, "--help")
+    assert result.returncode == 0, _render_failure("--help", result)
+    assert "tui" in result.stdout.lower(), "--help missing tui command"
+
+
+@pytest.mark.integration
+def test_cli_export_json_has_sha256(tmp_path: Path) -> None:
+    """Export --json must include bundle_sha256."""
+
+    repo_root, _ = _prepare_workspace(tmp_path)
+    _run_cli(repo_root, "run", "samples/specs/minimal_design_doc.md", "--mock")
+    result = _run_cli(repo_root, "export", "--json")
+    assert result.returncode == 0, _render_failure("export --json", result)
+    payload = json.loads(result.stdout)
+    assert payload["command"] == "export"
+    assert "bundle_sha256" in payload, "export JSON must include bundle_sha256"
+    assert len(payload["bundle_sha256"]) == 64, "bundle_sha256 must be 64-char hex string"
+    assert "bundle_path" in payload
+    assert "member_names" in payload

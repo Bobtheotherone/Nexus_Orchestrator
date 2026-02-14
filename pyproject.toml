@@ -58,7 +58,8 @@ dev = [
     "pip-audit==2.10.0",
 ]
 tui = [
-    # "textual>=0.50",           # TUI framework
+    "textual>=0.50,<1",
+    "rich>=13,<14",
 ]
 
 [project.scripts]
@@ -83,6 +84,16 @@ strict = true
 warn_return_any = true
 warn_unused_configs = true
 mypy_path = "src"
+
+exclude = ["src/nexus_orchestrator/ui/tui_app\\.py$"]
+
+[[tool.mypy.overrides]]
+module = [
+    "textual",
+    "textual.*",
+    "keyring",
+]
+ignore_missing_imports = true
 
 [tool.pytest.ini_options]
 minversion = "8.0"

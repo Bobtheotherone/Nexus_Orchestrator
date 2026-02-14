@@ -100,10 +100,11 @@ class ProviderSettings(TypedDict, total=False):
 
 
 class ProvidersConfig(TypedDict):
-    default: Literal["openai", "anthropic", "local"]
+    default: Literal["openai", "anthropic", "local", "tool"]
     openai: ProviderSettings
     anthropic: ProviderSettings
     local: ProviderSettings
+    tool: ProviderSettings
 
 
 class ResourcesConfig(TypedDict):
@@ -200,6 +201,7 @@ DEFAULT_CONFIG: Final[OrchestratorConfig] = {
             "api_key_env": "NEXUS_ANTHROPIC_API_KEY",
         },
         "local": {},
+        "tool": {},
     },
     "resources": {
         "orchestrator_cores": 2,
@@ -641,7 +643,7 @@ def _validate_providers(
     *,
     partial: bool,
 ) -> dict[str, Any]:
-    allowed = {"default", "openai", "anthropic", "local"}
+    allowed = {"default", "openai", "anthropic", "local", "tool"}
     _reject_unknown_keys(payload, allowed, path, issues)
     if not partial:
         _require_keys(payload, {"default", "openai", "anthropic"}, path, issues)
@@ -652,12 +654,12 @@ def _validate_providers(
             payload["default"],
             _join(path, "default"),
             issues,
-            allowed_values=("openai", "anthropic", "local"),
+            allowed_values=("openai", "anthropic", "local", "tool"),
         )
         if parsed_default is not None:
             out["default"] = parsed_default
 
-    for provider_name in ("openai", "anthropic", "local"):
+    for provider_name in ("openai", "anthropic", "local", "tool"):
         raw = payload.get(provider_name)
         if raw is None:
             continue
@@ -1174,7 +1176,7 @@ def _validate_provider_cross_fields(
             issues.add(_join(path, default_provider), "provider requires api_key_env")
 
     catalog = load_model_catalog()
-    for provider_name in ("openai", "anthropic", "local"):
+    for provider_name in ("openai", "anthropic", "local", "tool"):
         provider_payload = providers.get(provider_name)
         if not isinstance(provider_payload, Mapping):
             continue

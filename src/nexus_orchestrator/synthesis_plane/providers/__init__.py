@@ -60,6 +60,16 @@ from nexus_orchestrator.synthesis_plane.providers.openai_adapter import (
     OpenAIAdapter,
     OpenAIProvider,
 )
+from nexus_orchestrator.synthesis_plane.providers.tool_adapter import (
+    ToolBackend,
+    ToolProvider,
+)
+from nexus_orchestrator.synthesis_plane.providers.tool_detection import (
+    ToolBackendInfo,
+    detect_all_backends,
+    detect_claude_code_cli,
+    detect_codex_cli,
+)
 
 __all__ = [
     "AnthropicAdapter",
@@ -89,9 +99,15 @@ __all__ = [
     "ProviderUnavailableError",
     "ProviderUsage",
     "RedactedTranscript",
+    "ToolBackend",
+    "ToolBackendInfo",
     "ToolCall",
     "ToolDefinition",
+    "ToolProvider",
     "compute_backoff_delay",
+    "detect_all_backends",
+    "detect_claude_code_cli",
+    "detect_codex_cli",
     "derive_idempotency_key",
     "instantiate_provider_error",
     "is_retryable_error",
