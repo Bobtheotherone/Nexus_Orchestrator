@@ -32,6 +32,7 @@ from dataclasses import dataclass
 from typing import Any, Final, Literal, NotRequired, TypedDict
 
 from nexus_orchestrator.constants import CONFIG_SCHEMA_VERSION
+from nexus_orchestrator.synthesis_plane.model_catalog import load_model_catalog
 
 ConfigSchemaVersion: Final[int] = CONFIG_SCHEMA_VERSION
 BUILTIN_PROFILE_NAMES: Final[tuple[str, ...]] = (
@@ -1171,6 +1172,23 @@ def _validate_provider_cross_fields(
         env_name = selected.get("api_key_env")
         if not isinstance(env_name, str):
             issues.add(_join(path, default_provider), "provider requires api_key_env")
+
+    catalog = load_model_catalog()
+    for provider_name in ("openai", "anthropic", "local"):
+        provider_payload = providers.get(provider_name)
+        if not isinstance(provider_payload, Mapping):
+            continue
+        for field in ("model_code", "model_architect"):
+            model_value = provider_payload.get(field)
+            if not isinstance(model_value, str):
+                continue
+            try:
+                catalog.require(model_value, provider=provider_name)
+            except KeyError:
+                issues.add(
+                    _join(path, f"{provider_name}.{field}"),
+                    f"model {model_value!r} is not present in model catalog for provider {provider_name!r}",
+                )
 
 
 def _as_object(value: object, path: str, issues: _IssueCollector) -> dict[str, object] | None:

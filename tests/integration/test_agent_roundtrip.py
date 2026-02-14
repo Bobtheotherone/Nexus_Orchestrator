@@ -62,6 +62,7 @@ from nexus_orchestrator.synthesis_plane.dispatch import (
     ProviderRequest,
     ProviderResponse,
     ProviderUsage,
+    RepositoryDispatchPersistence,
 )
 
 if TYPE_CHECKING:
@@ -157,11 +158,11 @@ class _PatchProvider:
     patch: str
     calls: list[ProviderRequest] = field(default_factory=list)
 
-    async def generate(self, request: ProviderRequest) -> ProviderResponse:
+    async def send(self, request: ProviderRequest) -> ProviderResponse:
         self.calls.append(request)
         return ProviderResponse(
-            content=self.patch,
-            usage=ProviderUsage(tokens=42, cost_usd=0.01, latency_ms=2),
+            raw_text=self.patch,
+            usage=ProviderUsage(total_tokens=42, latency_ms=2, cost_estimate_usd=0.01),
             model=request.model,
             request_id="req-roundtrip-1",
         )
@@ -302,8 +303,11 @@ def test_agent_roundtrip_assemble_dispatch_patch_verify_with_persistence(tmp_pat
                 provider=provider,
             )
         ],
-        attempt_repo=attempt_repo,
-        provider_call_repo=provider_call_repo,
+        persistence=RepositoryDispatchPersistence(
+            attempt_repo=attempt_repo,
+            provider_call_repo=provider_call_repo,
+            persist_in_progress=True,
+        ),
     )
 
     dispatch_output = asyncio.run(

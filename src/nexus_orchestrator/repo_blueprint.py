@@ -461,7 +461,7 @@ def extract_header_metadata_from_text(path: str, text: str) -> HeaderExtraction:
         if suffix in {".toml", ".yaml", ".yml"} or filename in {"Makefile"}:
             prefix = "#"
             style = "hash_comment"
-        elif suffix in {".jsonc"}:
+        elif suffix in {".json", ".jsonc"}:
             prefix = "//"
             style = "slash_comment"
         if style is not None:

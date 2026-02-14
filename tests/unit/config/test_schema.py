@@ -89,6 +89,22 @@ def test_type_validation_reports_structured_paths() -> None:
     assert "expected integer" in messages["budgets.max_iterations"]
 
 
+def test_provider_model_fields_are_validated_against_model_catalog() -> None:
+    config = _load_toml(REPO_ROOT / "orchestrator.toml")
+    providers = _as_object_dict(config["providers"])
+    openai = _as_object_dict(providers["openai"])
+    openai["model_code"] = "nonexistent-openai-model"
+    providers["openai"] = openai
+    config["providers"] = providers
+
+    result = validate_config(config)
+
+    assert not result.is_valid
+    issues = {issue.path: issue.message for issue in result.issues}
+    assert "providers.openai.model_code" in issues
+    assert "not present in model catalog" in issues["providers.openai.model_code"]
+
+
 def test_range_violation_reports_exact_path() -> None:
     config = _load_toml(REPO_ROOT / "orchestrator.toml")
     budgets = _as_object_dict(config["budgets"])

@@ -22,6 +22,7 @@ Non-functional requirements
 from __future__ import annotations
 
 import asyncio
+import warnings
 from collections import deque
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
@@ -37,10 +38,23 @@ from nexus_orchestrator.synthesis_plane.dispatch import (
     DispatchFailedError,
     DispatchRequest,
     ProviderBinding,
-    ProviderCallError,
+    ProviderError,
     ProviderRequest,
     ProviderResponse,
     ProviderUsage,
+    RepositoryDispatchPersistence,
+)
+from nexus_orchestrator.synthesis_plane.providers.base import (
+    ProviderRequest as CanonicalProviderRequest,
+)
+from nexus_orchestrator.synthesis_plane.providers.base import (
+    ProviderResponse as CanonicalProviderResponse,
+)
+from nexus_orchestrator.synthesis_plane.providers.base import (
+    ProviderServiceError,
+)
+from nexus_orchestrator.synthesis_plane.providers.base import (
+    ProviderUsage as CanonicalProviderUsage,
 )
 from nexus_orchestrator.utils.concurrency import CancellationToken
 
@@ -70,8 +84,8 @@ def _request(
 
 def _response(content: str = "ok", *, tokens: int = 1, cost_usd: float = 0.01) -> ProviderResponse:
     return ProviderResponse(
-        content=content,
-        usage=ProviderUsage(tokens=tokens, cost_usd=cost_usd, latency_ms=1),
+        raw_text=content,
+        usage=ProviderUsage(total_tokens=tokens, latency_ms=1, cost_estimate_usd=cost_usd),
         model="mock-model",
         request_id="req-1",
     )
@@ -100,7 +114,7 @@ class BlockingProvider:
     max_in_flight: int = 0
     calls_started: int = 0
 
-    async def generate(self, request: ProviderRequest) -> ProviderResponse:
+    async def send(self, request: ProviderRequest) -> ProviderResponse:
         _ = request
         self.calls_started += 1
         self.in_flight += 1
@@ -118,7 +132,7 @@ class BlockingProvider:
 class ImmediateProvider:
     call_count: int = 0
 
-    async def generate(self, request: ProviderRequest) -> ProviderResponse:
+    async def send(self, request: ProviderRequest) -> ProviderResponse:
         _ = request
         self.call_count += 1
         return _response(content="immediate")
@@ -129,7 +143,7 @@ class ScriptedProvider:
     outcomes: deque[ProviderResponse | Exception]
     requests: list[ProviderRequest] = field(default_factory=list)
 
-    async def generate(self, request: ProviderRequest) -> ProviderResponse:
+    async def send(self, request: ProviderRequest) -> ProviderResponse:
         self.requests.append(request)
         if not self.outcomes:
             raise RuntimeError("scripted outcomes exhausted")
@@ -144,7 +158,7 @@ class NeverEndingProvider:
     started: asyncio.Event = field(default_factory=asyncio.Event)
     cancelled: asyncio.Event = field(default_factory=asyncio.Event)
 
-    async def generate(self, request: ProviderRequest) -> ProviderResponse:
+    async def send(self, request: ProviderRequest) -> ProviderResponse:
         _ = request
         self.started.set()
         try:
@@ -160,10 +174,36 @@ class FailingProvider:
     name: str
     call_count: int = 0
 
-    async def generate(self, request: ProviderRequest) -> ProviderResponse:
+    async def send(self, request: ProviderRequest) -> ProviderResponse:
         _ = request
         self.call_count += 1
-        raise ProviderCallError(provider=self.name, message="hard failure", retryable=False)
+        raise ProviderServiceError(provider=self.name, detail="hard failure", retryable=False)
+
+
+@dataclass(slots=True)
+class DualPathProvider:
+    send_calls: int = 0
+    generate_calls: int = 0
+
+    async def send(self, request: ProviderRequest) -> ProviderResponse:
+        _ = request
+        self.send_calls += 1
+        return _response(content="send-path")
+
+    async def generate(self, request: ProviderRequest) -> ProviderResponse:
+        _ = request
+        self.generate_calls += 1
+        return _response(content="generate-path")
+
+
+@dataclass(slots=True)
+class LegacyGenerateProvider:
+    generate_calls: int = 0
+
+    async def generate(self, request: ProviderRequest) -> ProviderResponse:
+        _ = request
+        self.generate_calls += 1
+        return _response(content="legacy-generate")
 
 
 @dataclass(slots=True)
@@ -200,6 +240,13 @@ def _valid_ids(seed: int) -> tuple[str, str]:
         timestamp_ms=timestamp + 1, randbytes=_randbytes(seed + 2)
     )
     return run_id, work_item_id
+
+
+def test_dispatch_reexports_canonical_provider_stack() -> None:
+    assert ProviderRequest is CanonicalProviderRequest
+    assert ProviderResponse is CanonicalProviderResponse
+    assert ProviderUsage is CanonicalProviderUsage
+    assert issubclass(ProviderError, Exception)
 
 
 async def test_dispatch_enforces_per_provider_concurrency_cap() -> None:
@@ -258,13 +305,42 @@ async def test_dispatch_waits_for_deterministic_rate_limit_window() -> None:
     assert fake_clock.sleep_calls == [5.0]
 
 
+async def test_dispatch_prefers_send_over_legacy_generate() -> None:
+    provider = DualPathProvider()
+    controller = DispatchController(
+        [ProviderBinding(name="mock", model="mock-model", provider=provider)]
+    )
+
+    with warnings.catch_warnings(record=True) as captured:
+        warnings.simplefilter("always")
+        result = await controller.dispatch(_request(11))
+
+    assert result.content == "send-path"
+    assert provider.send_calls == 1
+    assert provider.generate_calls == 0
+    assert not any("provider.generate" in str(item.message) for item in captured)
+
+
+async def test_dispatch_supports_legacy_generate_with_deprecation_warning() -> None:
+    provider = LegacyGenerateProvider()
+    controller = DispatchController(
+        [ProviderBinding(name="mock", model="mock-model", provider=provider)]
+    )
+
+    with pytest.warns(DeprecationWarning, match="provider.generate"):
+        result = await controller.dispatch(_request(12))
+
+    assert result.content == "legacy-generate"
+    assert provider.generate_calls == 1
+
+
 async def test_dispatch_retries_with_backoff_and_stable_idempotency_key() -> None:
     fake_clock = FakeClock()
     provider = ScriptedProvider(
         outcomes=deque(
             [
-                ProviderCallError(provider="mock", message="retry one", retryable=True),
-                ProviderCallError(provider="mock", message="retry two", retryable=True),
+                ProviderServiceError(provider="mock", detail="retry one", retryable=True),
+                ProviderServiceError(provider="mock", detail="retry two", retryable=True),
                 _response(content="final", tokens=7, cost_usd=0.03),
             ]
         )
@@ -352,7 +428,7 @@ async def test_dispatch_adaptive_routing_switches_provider_after_failure() -> No
     assert beta.call_count == 1
 
 
-async def test_dispatch_persists_attempts_and_provider_calls_when_repos_exist() -> None:
+async def test_dispatch_persists_attempts_and_provider_calls_when_wired_explicitly() -> None:
     secret = "sk-FAKEOPENAIKEY1234567890ABCDE"
     provider = ScriptedProvider(
         outcomes=deque(
@@ -367,8 +443,11 @@ async def test_dispatch_persists_attempts_and_provider_calls_when_repos_exist() 
     controller = DispatchController(
         [ProviderBinding(name="mock", model="mock-model", provider=provider)],
         transcript_retention=1,
-        attempt_repo=attempt_repo,
-        provider_call_repo=provider_call_repo,
+        persistence=RepositoryDispatchPersistence(
+            attempt_repo=attempt_repo,
+            provider_call_repo=provider_call_repo,
+            persist_in_progress=False,
+        ),
     )
 
     run_id, first_work_item_id = _valid_ids(10)
@@ -406,3 +485,32 @@ async def test_dispatch_persists_attempts_and_provider_calls_when_repos_exist() 
     assert secret not in transcript.response
     assert "***REDACTED***" in transcript.prompt
     assert "***REDACTED***" in transcript.response
+
+
+async def test_dispatch_persistence_in_progress_flag_is_explicit() -> None:
+    provider = ScriptedProvider(outcomes=deque([_response(content="ok", tokens=2, cost_usd=0.01)]))
+    attempt_repo = RecordingAttemptRepo()
+    provider_call_repo = RecordingProviderCallRepo()
+    controller = DispatchController(
+        [ProviderBinding(name="mock", model="mock-model", provider=provider)],
+        persistence=RepositoryDispatchPersistence(
+            attempt_repo=attempt_repo,
+            provider_call_repo=provider_call_repo,
+            persist_in_progress=True,
+        ),
+    )
+
+    run_id, work_item_id = _valid_ids(30)
+    await controller.dispatch(
+        DispatchRequest(
+            run_id=run_id,
+            work_item_id=work_item_id,
+            role="implementer",
+            prompt="explicit persistence",
+        )
+    )
+
+    assert len(attempt_repo.attempts) == 2
+    assert attempt_repo.attempts[0].feedback == "dispatch_in_progress"
+    assert attempt_repo.attempts[-1].result is AttemptResult.SUCCESS
+    assert len(provider_call_repo.records) == 1

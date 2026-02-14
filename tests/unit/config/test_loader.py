@@ -33,6 +33,7 @@ from nexus_orchestrator.config.loader import (
     dump_effective_config,
     load_config,
 )
+from nexus_orchestrator.synthesis_plane.roles import ROLE_IMPLEMENTER, RoleRegistry
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 
@@ -170,6 +171,32 @@ def test_can_load_repo_orchestrator_toml_with_profile_and_env_override() -> None
     )
 
     assert loaded["budgets"]["max_iterations"] == 9
+
+
+def test_config_model_overrides_affect_role_routing_without_code_edits(tmp_path: Path) -> None:
+    config_path = tmp_path / "orchestrator.toml"
+    _write_config(
+        config_path,
+        """
+[providers.openai]
+model_code = "gpt-4.1-mini"
+model_architect = "gpt-5"
+
+[providers.anthropic]
+model_code = "claude-3-7-sonnet"
+model_architect = "claude-opus-4-6"
+""".strip(),
+    )
+
+    loaded = load_config(config_path)
+    registry = RoleRegistry.from_config(loaded)
+    first = registry.route_attempt(role_name=ROLE_IMPLEMENTER, attempt_number=1)
+    third = registry.route_attempt(role_name=ROLE_IMPLEMENTER, attempt_number=3)
+
+    assert first is not None
+    assert first.model == "gpt-4.1-mini"
+    assert third is not None
+    assert third.model == "claude-3-7-sonnet"
 
 
 def test_config_package_exports_loader_and_errors(tmp_path: Path) -> None:

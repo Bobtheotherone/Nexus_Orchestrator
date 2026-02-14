@@ -22,11 +22,12 @@ from __future__ import annotations
 
 import asyncio
 import importlib
+import json
 import os
 import random as random_module
 import time
-from collections.abc import Mapping, Sequence
-from typing import Protocol, cast
+from collections.abc import Callable, Mapping, Sequence
+from typing import TYPE_CHECKING, Protocol, cast
 
 from nexus_orchestrator.synthesis_plane.providers.base import (
     BackoffConfig,
@@ -45,6 +46,7 @@ from nexus_orchestrator.synthesis_plane.providers.base import (
     ProviderUnavailableError,
     ProviderUsage,
     RandomFn,
+    RemoteMCPToolConfig,
     SleepFn,
     ToolCall,
     ToolDefinition,
@@ -52,6 +54,9 @@ from nexus_orchestrator.synthesis_plane.providers.base import (
     parse_tool_arguments,
     run_with_retries,
 )
+
+if TYPE_CHECKING:
+    from nexus_orchestrator.synthesis_plane.model_catalog import ModelCatalog
 
 
 class _AnthropicMessagesAPI(Protocol):
@@ -72,15 +77,19 @@ class AnthropicProvider(BaseProvider):
         *,
         model: str,
         api_key: str | None = None,
+        api_key_env: str | None = None,
         base_url: str | None = None,
         timeout_seconds: float | None = None,
         client: _AnthropicClient | None = None,
         backoff: BackoffConfig | None = None,
         sleep: SleepFn = asyncio.sleep,
         random_fn: RandomFn = random_module.random,
+        model_catalog: ModelCatalog | None = None,
     ) -> None:
+        super().__init__(model_catalog=model_catalog)
         self.model = _validate_non_empty_str(model, "model")
         self._api_key = _validate_optional_str(api_key, "api_key")
+        self._api_key_env = _validate_optional_str(api_key_env, "api_key_env")
         self._base_url = _validate_optional_str(base_url, "base_url")
 
         if timeout_seconds is not None and timeout_seconds <= 0:
@@ -128,20 +137,13 @@ class AnthropicProvider(BaseProvider):
         )
 
     def supports_tool_calling(self, model: str) -> bool:
-        _ = _validate_non_empty_str(model, "model")
-        return True
+        return super().supports_tool_calling(model)
 
     def max_context_tokens(self, model: str) -> int:
-        _ = _validate_non_empty_str(model, "model")
-        return 200_000
+        return super().max_context_tokens(model)
 
     def estimate_cost(self, tokens: int, model: str) -> float:
-        normalized = _validate_non_empty_str(model, "model")
-        if normalized.startswith("claude-opus"):
-            return (tokens / 1000.0) * 0.020
-        if normalized.startswith("claude-sonnet"):
-            return (tokens / 1000.0) * 0.008
-        return super().estimate_cost(tokens, normalized)
+        return super().estimate_cost(tokens, model)
 
     def _ensure_client(self) -> _AnthropicClient:
         if self._client is not None:
@@ -165,15 +167,7 @@ class AnthropicProvider(BaseProvider):
                 detail="anthropic SDK does not expose AsyncAnthropic",
             )
 
-        api_key = (
-            self._api_key or os.getenv("ANTHROPIC_API_KEY") or os.getenv("NEXUS_ANTHROPIC_API_KEY")
-        )
-        if api_key is None:
-            raise ProviderAuthenticationError(
-                provider=self.provider_name,
-                detail="missing Anthropic API key; set ANTHROPIC_API_KEY or NEXUS_ANTHROPIC_API_KEY",
-                http_status=401,
-            )
+        api_key = self._resolve_api_key()
 
         init_kwargs: dict[str, object] = {"api_key": api_key}
         if self._base_url is not None:
@@ -189,6 +183,31 @@ class AnthropicProvider(BaseProvider):
             )
 
         return cast("_AnthropicClient", client)
+
+    def _resolve_api_key(self) -> str:
+        if self._api_key is not None:
+            return self._api_key
+
+        if self._api_key_env is not None:
+            configured = os.getenv(self._api_key_env)
+            if configured is None or not configured.strip():
+                raise ProviderAuthenticationError(
+                    provider=self.provider_name,
+                    detail=f"missing Anthropic API key in configured env var {self._api_key_env}",
+                    http_status=401,
+                )
+            return configured
+
+        fallback_key = os.getenv("ANTHROPIC_API_KEY") or os.getenv("NEXUS_ANTHROPIC_API_KEY")
+        if fallback_key is None or not fallback_key.strip():
+            raise ProviderAuthenticationError(
+                provider=self.provider_name,
+                detail=(
+                    "missing Anthropic API key; set ANTHROPIC_API_KEY or NEXUS_ANTHROPIC_API_KEY"
+                ),
+                http_status=401,
+            )
+        return fallback_key
 
     async def _create_response(
         self,
@@ -220,9 +239,45 @@ class AnthropicProvider(BaseProvider):
 
         if request.temperature is not None:
             payload["temperature"] = request.temperature
+        if request.reasoning_effort is not None:
+            payload["thinking"] = {"type": "enabled", "effort": request.reasoning_effort}
 
+        tools: list[dict[str, object]] = []
         if request.tool_permissions:
-            payload["tools"] = [_tool_definition_payload(tool) for tool in request.tool_permissions]
+            tools.extend(_tool_definition_payload(tool) for tool in request.tool_permissions)
+        if request.structured_output is not None:
+            tools.append(
+                _structured_output_tool_payload(
+                    name=request.structured_output.name,
+                    json_schema=request.structured_output.json_schema,
+                    description=request.structured_output.description,
+                )
+            )
+            payload["response_format"] = {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": request.structured_output.name,
+                    "schema": dict(request.structured_output.json_schema),
+                    "strict": bool(request.structured_output.strict),
+                },
+            }
+        if tools:
+            payload["tools"] = tools
+
+        if request.tool_choice is not None:
+            payload["tool_choice"] = request.tool_choice
+        elif request.requested_tools:
+            payload["tool_choice"] = {
+                "type": "allowed_tools",
+                "allowed_tools": list(request.requested_tools),
+            }
+        elif request.structured_output is not None:
+            payload["tool_choice"] = {"type": "tool", "name": request.structured_output.name}
+
+        if request.remote_mcp_tools:
+            payload["mcp_servers"] = [
+                _remote_mcp_server_payload(server) for server in request.remote_mcp_tools
+            ]
 
         return payload
 
@@ -235,21 +290,35 @@ class AnthropicProvider(BaseProvider):
         latency_ms: int,
         idempotency_header_sent: bool,
     ) -> ProviderResponse:
-        raw_text, tool_calls = _extract_anthropic_output(raw_response)
+        raw_text, tool_calls, structured_output = _extract_anthropic_output(
+            raw_response,
+            structured_output_tool_name=(
+                request.structured_output.name if request.structured_output is not None else None
+            ),
+        )
         model_value = _read_str(raw_response, "model") or request.model
         request_id = _read_str(raw_response, "id") or _read_str(raw_response, "request_id")
 
         usage = _normalize_usage(raw_response)
+        total_tokens = usage.total_tokens
+        if total_tokens == 0:
+            total_tokens = usage.input_tokens + usage.output_tokens
+        estimated_cost = _estimate_cost_from_catalog(
+            provider=self.provider_name,
+            model_catalog=self._model_catalog,
+            model=model_value,
+            total_tokens=total_tokens,
+            input_tokens=usage.input_tokens,
+            output_tokens=usage.output_tokens,
+            fallback=self.estimate_cost,
+        )
         if usage.total_tokens == 0:
             usage = ProviderUsage(
                 input_tokens=usage.input_tokens,
                 output_tokens=usage.output_tokens,
-                total_tokens=usage.input_tokens + usage.output_tokens,
+                total_tokens=total_tokens,
                 latency_ms=latency_ms,
-                cost_estimate_usd=self.estimate_cost(
-                    usage.input_tokens + usage.output_tokens,
-                    model_value,
-                ),
+                cost_estimate_usd=estimated_cost,
             )
         else:
             usage = ProviderUsage(
@@ -257,7 +326,7 @@ class AnthropicProvider(BaseProvider):
                 output_tokens=usage.output_tokens,
                 total_tokens=usage.total_tokens,
                 latency_ms=latency_ms,
-                cost_estimate_usd=self.estimate_cost(usage.total_tokens, model_value),
+                cost_estimate_usd=estimated_cost,
             )
 
         finish_reason = _read_str(raw_response, "stop_reason")
@@ -274,6 +343,7 @@ class AnthropicProvider(BaseProvider):
             model=model_value,
             raw_text=raw_text,
             usage=usage,
+            structured_output=structured_output,
             tool_calls=tool_calls,
             request_id=request_id,
             idempotency_key=idempotency_key,
@@ -356,6 +426,10 @@ def _normalize_request(request: ProviderRequest, *, default_model: str) -> Provi
         context_docs=request.context_docs,
         tool_permissions=request.tool_permissions,
         requested_tools=request.requested_tools,
+        reasoning_effort=request.reasoning_effort,
+        tool_choice=request.tool_choice,
+        remote_mcp_tools=request.remote_mcp_tools,
+        structured_output=request.structured_output,
         max_tokens=request.max_tokens,
         temperature=request.temperature,
         idempotency_key=request.idempotency_key,
@@ -388,9 +462,49 @@ def _tool_definition_payload(tool: ToolDefinition) -> dict[str, object]:
     return out
 
 
-def _extract_anthropic_output(raw_response: object) -> tuple[str, tuple[ToolCall, ...]]:
+def _structured_output_tool_payload(
+    *,
+    name: str,
+    json_schema: Mapping[str, JSONValue],
+    description: str | None,
+) -> dict[str, object]:
+    out: dict[str, object] = {
+        "name": name,
+        "input_schema": dict(json_schema),
+    }
+    if description is not None:
+        out["description"] = description
+    return out
+
+
+def _remote_mcp_server_payload(server: RemoteMCPToolConfig) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "server_name": server.server_label,
+        "server_url": server.server_url,
+    }
+    if server.allowed_tools:
+        payload["allowed_tools"] = list(server.allowed_tools)
+    if server.require_approval is not None:
+        payload["require_approval"] = server.require_approval
+
+    headers = dict(server.headers)
+    if server.authorization_token_env is not None:
+        token_value = os.getenv(server.authorization_token_env)
+        if token_value is not None and token_value.strip():
+            headers["Authorization"] = f"Bearer {token_value}"
+    if headers:
+        payload["headers"] = headers
+    return payload
+
+
+def _extract_anthropic_output(
+    raw_response: object,
+    *,
+    structured_output_tool_name: str | None = None,
+) -> tuple[str, tuple[ToolCall, ...], JSONValue | None]:
     text_chunks: list[str] = []
     tool_calls: list[ToolCall] = []
+    structured_output = _extract_anthropic_structured_output(raw_response)
 
     for item in _read_sequence(raw_response, "content"):
         item_type = (_read_str(item, "type") or "").lower()
@@ -398,6 +512,14 @@ def _extract_anthropic_output(raw_response: object) -> tuple[str, tuple[ToolCall
             text_value = _read_str(item, "text")
             if text_value:
                 text_chunks.append(text_value)
+            if structured_output is None and _looks_like_json_document(text_value or ""):
+                structured_output = _coerce_structured_candidate(text_value)
+        elif item_type in {"json", "output_json"}:
+            parsed = _coerce_structured_candidate(
+                _read_value(item, "json", default=_read_value(item, "value"))
+            )
+            if parsed is not None:
+                structured_output = parsed
         elif item_type == "tool_use":
             name = _read_str(item, "name")
             if name is None:
@@ -408,16 +530,80 @@ def _extract_anthropic_output(raw_response: object) -> tuple[str, tuple[ToolCall
             arguments = parse_tool_arguments(
                 _read_value(item, "input"), provider="anthropic", tool_name=name
             )
-            tool_calls.append(ToolCall(call_id=call_id, name=name, arguments=arguments))
+            if structured_output_tool_name is not None and name == structured_output_tool_name:
+                structured_output = arguments
+            else:
+                tool_calls.append(ToolCall(call_id=call_id, name=name, arguments=arguments))
 
     combined_text = "\n".join(chunk for chunk in text_chunks if chunk.strip())
-    if not combined_text and not tool_calls:
+    if not combined_text and not tool_calls and structured_output is None:
         raise ProviderResponseError(
             provider="anthropic",
             detail="response does not contain text or tool calls",
         )
 
-    return combined_text, tuple(tool_calls)
+    return combined_text, tuple(tool_calls), structured_output
+
+
+def _extract_anthropic_structured_output(raw_response: object) -> JSONValue | None:
+    direct_candidates = (
+        _read_value(raw_response, "output_parsed"),
+        _read_value(raw_response, "parsed"),
+        _read_value(raw_response, "structured_output"),
+    )
+    for candidate in direct_candidates:
+        parsed = _coerce_structured_candidate(candidate)
+        if parsed is not None:
+            return parsed
+    return None
+
+
+def _coerce_structured_candidate(candidate: object) -> JSONValue | None:
+    if candidate is None:
+        return None
+    if isinstance(candidate, bool):
+        return candidate
+    if isinstance(candidate, int):
+        return candidate
+    if isinstance(candidate, float):
+        return candidate
+    if isinstance(candidate, str):
+        stripped = candidate.strip()
+        if not stripped:
+            return None
+        if _looks_like_json_document(stripped):
+            try:
+                parsed = json.loads(stripped)
+            except json.JSONDecodeError:
+                return stripped
+            return _coerce_structured_candidate(parsed)
+        return stripped
+    if isinstance(candidate, Mapping):
+        out: dict[str, JSONValue] = {}
+        for key, value in candidate.items():
+            if not isinstance(key, str):
+                return None
+            normalized = _coerce_structured_candidate(value)
+            if normalized is None and value is not None:
+                return None
+            out[key] = normalized
+        return out
+    if isinstance(candidate, Sequence) and not isinstance(candidate, (str, bytes, bytearray)):
+        out_list: list[JSONValue] = []
+        for item in candidate:
+            normalized = _coerce_structured_candidate(item)
+            if normalized is None and item is not None:
+                return None
+            out_list.append(normalized)
+        return out_list
+    return None
+
+
+def _looks_like_json_document(value: str) -> bool:
+    stripped = value.strip()
+    if not stripped:
+        return False
+    return stripped.startswith("{") or stripped.startswith("[")
 
 
 def _normalize_usage(raw_response: object) -> ProviderUsage:
@@ -436,6 +622,28 @@ def _normalize_usage(raw_response: object) -> ProviderUsage:
         output_tokens=output_tokens,
         total_tokens=total_tokens,
     )
+
+
+def _estimate_cost_from_catalog(
+    *,
+    provider: str,
+    model_catalog: ModelCatalog,
+    model: str,
+    total_tokens: int,
+    input_tokens: int,
+    output_tokens: int,
+    fallback: Callable[[int, str], float],
+) -> float:
+    try:
+        return model_catalog.estimate_cost(
+            provider=provider,
+            model=model,
+            total_tokens=total_tokens,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+        )
+    except KeyError:
+        return float(fallback(total_tokens, model))
 
 
 def _exception_detail(exc: BaseException) -> str:

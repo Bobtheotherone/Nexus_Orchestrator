@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+import warnings
 from collections import deque
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -36,6 +37,16 @@ from nexus_orchestrator.domain import ids
 from nexus_orchestrator.domain.models import Attempt, AttemptResult
 from nexus_orchestrator.persistence.repositories import ProviderCallRecord
 from nexus_orchestrator.security.redaction import redact_text
+from nexus_orchestrator.synthesis_plane.providers.base import (
+    ProviderError,
+    ProviderRequest,
+    ProviderResponse,
+    ProviderServiceError,
+    ProviderUsage,
+)
+from nexus_orchestrator.synthesis_plane.providers.base import (
+    ProviderProtocol as BaseProviderProtocol,
+)
 from nexus_orchestrator.utils.hashing import sha256_text
 
 try:
@@ -66,8 +77,8 @@ class DispatchFailedError(DispatchError):
     """Raised when all candidate providers fail."""
 
 
-class ProviderCallError(DispatchError):
-    """Normalized provider failure with retryability classification."""
+class ProviderCallError(ProviderServiceError):
+    """Deprecated compatibility shim for pre-canonical dispatch errors."""
 
     def __init__(
         self,
@@ -77,68 +88,18 @@ class ProviderCallError(DispatchError):
         retryable: bool,
         code: str | None = None,
     ) -> None:
-        self.provider = _validate_non_empty_str(provider, "provider")
-        self.retryable = bool(retryable)
-        self.code = _validate_non_empty_str(code, "code") if code is not None else None
-        super().__init__(message)
-
-
-@dataclass(slots=True)
-class ProviderUsage:
-    """Provider usage accounting payload."""
-
-    tokens: int
-    cost_usd: float
-    latency_ms: int
-
-    def __post_init__(self) -> None:
-        if self.tokens < 0:
-            raise ValueError("tokens must be >= 0")
-        if self.cost_usd < 0:
-            raise ValueError("cost_usd must be >= 0")
-        if self.latency_ms < 0:
-            raise ValueError("latency_ms must be >= 0")
-
-
-@dataclass(slots=True)
-class ProviderRequest:
-    """Structured request sent to a provider adapter."""
-
-    run_id: str
-    work_item_id: str
-    role: str
-    model: str
-    prompt: str
-    idempotency_key: str
-    metadata: Mapping[str, object] = field(default_factory=dict)
-
-    def __post_init__(self) -> None:
-        self.run_id = _validate_non_empty_str(self.run_id, "run_id")
-        self.work_item_id = _validate_non_empty_str(self.work_item_id, "work_item_id")
-        self.role = _validate_non_empty_str(self.role, "role")
-        self.model = _validate_non_empty_str(self.model, "model")
-        self.prompt = _validate_non_empty_str(self.prompt, "prompt", strip=False)
-        self.idempotency_key = _validate_non_empty_str(self.idempotency_key, "idempotency_key")
-        self.metadata = dict(self.metadata)
-
-
-@dataclass(slots=True)
-class ProviderResponse:
-    """Structured response returned by a provider adapter."""
-
-    content: str
-    usage: ProviderUsage
-    model: str | None = None
-    request_id: str | None = None
-    metadata: Mapping[str, object] = field(default_factory=dict)
-
-    def __post_init__(self) -> None:
-        self.content = _validate_non_empty_str(self.content, "content", strip=False)
-        if self.model is not None:
-            self.model = _validate_non_empty_str(self.model, "model")
-        if self.request_id is not None:
-            self.request_id = _validate_non_empty_str(self.request_id, "request_id")
-        self.metadata = dict(self.metadata)
+        warnings.warn(
+            "ProviderCallError is deprecated; raise ProviderError subclasses from "
+            "nexus_orchestrator.synthesis_plane.providers.base",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        super().__init__(
+            provider=provider,
+            detail=message,
+            retryable=retryable,
+            provider_code=code,
+        )
 
 
 @dataclass(slots=True)
@@ -250,7 +211,7 @@ class ProviderBinding:
 
     name: str
     model: str
-    provider: ProviderProtocol
+    provider: ProviderProtocol | LegacyGenerateProviderProtocol
     max_concurrency: int = 1
     rate_limit_calls: int = 0
     rate_limit_period_seconds: float = 1.0
@@ -261,6 +222,10 @@ class ProviderBinding:
     def __post_init__(self) -> None:
         self.name = _validate_non_empty_str(self.name, "name")
         self.model = _validate_non_empty_str(self.model, "model")
+        if not isinstance(self.provider, ProviderProtocol) and not isinstance(
+            self.provider, LegacyGenerateProviderProtocol
+        ):
+            raise TypeError("provider must implement send(request) or legacy generate(request)")
         if self.max_concurrency <= 0:
             raise ValueError("max_concurrency must be > 0")
         if self.rate_limit_calls < 0:
@@ -275,9 +240,12 @@ class ProviderBinding:
             raise ValueError("retry_backoff_multiplier must be >= 1.0")
 
 
+ProviderProtocol = BaseProviderProtocol
+
+
 @runtime_checkable
-class ProviderProtocol(Protocol):
-    """Provider adapter protocol used by the dispatch controller."""
+class LegacyGenerateProviderProtocol(Protocol):
+    """Deprecated provider protocol maintained as a compatibility shim."""
 
     async def generate(self, request: ProviderRequest) -> ProviderResponse: ...
 
@@ -306,6 +274,36 @@ class ProviderCallRepoAddProtocol(Protocol):
 
 
 ProviderCallRepoLike = ProviderCallRepoSaveProtocol | ProviderCallRepoAddProtocol
+
+
+@runtime_checkable
+class DispatchPersistenceProtocol(Protocol):
+    """Explicit persistence wiring used by dispatch."""
+
+    @property
+    def persist_in_progress(self) -> bool: ...
+
+    def save_attempt(self, attempt: Attempt) -> Attempt: ...
+
+    def save_provider_call(self, record: ProviderCallRecord) -> ProviderCallRecord: ...
+
+
+@dataclass(slots=True)
+class RepositoryDispatchPersistence:
+    """Repository-backed dispatch persistence wiring."""
+
+    attempt_repo: AttemptRepoLike
+    provider_call_repo: ProviderCallRepoLike
+    persist_in_progress: bool = False
+
+    def __post_init__(self) -> None:
+        self.persist_in_progress = bool(self.persist_in_progress)
+
+    def save_attempt(self, attempt: Attempt) -> Attempt:
+        return _save_attempt(self.attempt_repo, attempt)
+
+    def save_provider_call(self, record: ProviderCallRecord) -> ProviderCallRecord:
+        return _save_provider_call(self.provider_call_repo, record)
 
 
 @dataclass(slots=True)
@@ -389,6 +387,7 @@ class DispatchController:
         clock: Clock = time.monotonic,
         sleep: SleepFn = asyncio.sleep,
         transcript_retention: int = 256,
+        persistence: DispatchPersistenceProtocol | None = None,
         attempt_repo: AttemptRepoLike | None = None,
         provider_call_repo: ProviderCallRepoLike | None = None,
     ) -> None:
@@ -420,8 +419,11 @@ class DispatchController:
 
         self._route_stats: dict[str, dict[str, _RoutingStats]] = {}
         self._transcripts: deque[TranscriptEntry] = deque(maxlen=transcript_retention)
-        self._attempt_repo = attempt_repo
-        self._provider_call_repo = provider_call_repo
+        self._persistence = _resolve_dispatch_persistence(
+            persistence=persistence,
+            attempt_repo=attempt_repo,
+            provider_call_repo=provider_call_repo,
+        )
         self._attempt_sequence = 0
 
     async def dispatch(
@@ -452,12 +454,7 @@ class DispatchController:
         final_feedback: str | None = None
         last_error: Exception | None = None
 
-        if (
-            self._attempt_repo is not None
-            and self._provider_call_repo is not None
-            and hasattr(self._attempt_repo, "_db")
-            and hasattr(self._provider_call_repo, "_db")
-        ):
+        if self._persistence is not None and self._persistence.persist_in_progress:
             self._persist_attempt(
                 attempt_id=attempt_id,
                 request=request,
@@ -508,17 +505,21 @@ class DispatchController:
                             cancel_token=token,
                         )
                         try:
+                            provider_metadata = dict(request.metadata)
+                            provider_metadata.setdefault("run_id", request.run_id)
+                            provider_metadata.setdefault("work_item_id", request.work_item_id)
                             provider_request = ProviderRequest(
-                                run_id=request.run_id,
-                                work_item_id=request.work_item_id,
-                                role=request.role,
                                 model=runtime.binding.model,
-                                prompt=request.prompt,
+                                role_id=request.role,
+                                user_prompt=request.prompt,
                                 idempotency_key=provider_idempotency_key,
-                                metadata=request.metadata,
+                                metadata=provider_metadata,
                             )
                             response = await _await_with_cancellation(
-                                runtime.binding.provider.generate(provider_request),
+                                _call_provider(
+                                    provider=runtime.binding.provider,
+                                    request=provider_request,
+                                ),
                                 cancel_token=token,
                             )
                         finally:
@@ -528,16 +529,16 @@ class DispatchController:
                         final_result = AttemptResult.TIMEOUT
                         final_feedback = "dispatch cancelled"
                         raise
-                    except ProviderCallError as exc:
+                    except ProviderError as exc:
                         last_error = exc
                         error_text = str(exc)
                         retryable_error = exc.retryable
                         self._mark_route_failure(route_key=route_key, provider_name=provider_name)
                         final_feedback = _truncate_feedback(error_text)
                     except Exception as exc:  # noqa: BLE001
-                        wrapped = ProviderCallError(
+                        wrapped = ProviderServiceError(
                             provider=provider_name,
-                            message=str(exc),
+                            detail=str(exc),
                             retryable=False,
                         )
                         last_error = wrapped
@@ -549,11 +550,18 @@ class DispatchController:
                     latency_ms = int(round(max(0.0, call_finished - call_started) * 1000))
 
                     if response is not None:
-                        spent_tokens += response.usage.tokens
-                        spent_cost += response.usage.cost_usd
+                        usage_tokens = _usage_total_tokens(response.usage)
+                        usage_cost = _usage_cost_usd(response.usage)
+                        usage_latency_ms = (
+                            response.usage.latency_ms
+                            if response.usage.latency_ms is not None
+                            else latency_ms
+                        )
+                        spent_tokens += usage_tokens
+                        spent_cost += usage_cost
                         final_result = AttemptResult.SUCCESS
                         final_feedback = None
-                        selected_model = response.model or runtime.binding.model
+                        selected_model = response.model
                         self._mark_route_success(route_key=route_key, provider_name=provider_name)
                         self._record_transcript(
                             run_id=request.run_id,
@@ -562,7 +570,7 @@ class DispatchController:
                             attempt_number=attempts_made,
                             idempotency_key=provider_idempotency_key,
                             prompt=request.prompt,
-                            response=response.content,
+                            response=response.raw_text,
                             error=None,
                             created_at=call_started_at,
                         )
@@ -572,9 +580,9 @@ class DispatchController:
                             model=selected_model,
                             attempts_made=attempts_made,
                             idempotency_key=provider_idempotency_key,
-                            tokens=response.usage.tokens,
-                            cost_usd=response.usage.cost_usd,
-                            latency_ms=response.usage.latency_ms or latency_ms,
+                            tokens=usage_tokens,
+                            cost_usd=usage_cost,
+                            latency_ms=usage_latency_ms,
                             request_id=response.request_id,
                             error=None,
                             created_at=call_started_at,
@@ -582,12 +590,12 @@ class DispatchController:
                         return DispatchResult(
                             provider=provider_name,
                             model=selected_model,
-                            content=response.content,
+                            content=response.raw_text,
                             idempotency_key=provider_idempotency_key,
                             attempts=attempts_made,
                             tokens_used=spent_tokens,
                             cost_usd=spent_cost,
-                            latency_ms=response.usage.latency_ms or latency_ms,
+                            latency_ms=usage_latency_ms,
                             request_id=response.request_id,
                             attempt_id=attempt_id,
                         )
@@ -792,7 +800,7 @@ class DispatchController:
         finished_at: datetime,
         feedback: str | None,
     ) -> None:
-        if self._attempt_repo is None:
+        if self._persistence is None:
             return
 
         attempt = Attempt(
@@ -811,7 +819,7 @@ class DispatchController:
             finished_at=finished_at,
             feedback=feedback,
         )
-        _save_attempt(self._attempt_repo, attempt)
+        self._persistence.save_attempt(attempt)
 
     def _persist_provider_call(
         self,
@@ -828,7 +836,7 @@ class DispatchController:
         error: str | None,
         created_at: datetime,
     ) -> None:
-        if self._provider_call_repo is None:
+        if self._persistence is None:
             return
         record_id = _provider_call_record_id(
             attempt_id=attempt_id,
@@ -853,7 +861,7 @@ class DispatchController:
             error=_truncate_feedback(error) if error is not None else None,
             metadata=metadata,
         )
-        _save_provider_call(self._provider_call_repo, record)
+        self._persistence.save_provider_call(record)
 
     def _build_attempt_id(self, *, request: DispatchRequest, idempotency_key: str) -> str:
         self._attempt_sequence += 1
@@ -891,6 +899,74 @@ def _save_provider_call(
     if isinstance(repo, ProviderCallRepoAddProtocol):
         return repo.add(record)
     raise TypeError("provider_call_repo must implement save(record) or add(record)")
+
+
+def _resolve_dispatch_persistence(
+    *,
+    persistence: DispatchPersistenceProtocol | None,
+    attempt_repo: AttemptRepoLike | None,
+    provider_call_repo: ProviderCallRepoLike | None,
+) -> DispatchPersistenceProtocol | None:
+    if persistence is not None:
+        if attempt_repo is not None or provider_call_repo is not None:
+            raise ValueError(
+                "use either persistence=... or attempt_repo/provider_call_repo, not both"
+            )
+        if not isinstance(persistence, DispatchPersistenceProtocol):
+            raise TypeError("persistence must implement DispatchPersistenceProtocol")
+        return persistence
+
+    if attempt_repo is None and provider_call_repo is None:
+        return None
+    if attempt_repo is None or provider_call_repo is None:
+        raise ValueError(
+            "attempt_repo and provider_call_repo must either both be provided or both be omitted"
+        )
+
+    warnings.warn(
+        "DispatchController(... attempt_repo=..., provider_call_repo=...) is deprecated; "
+        "use persistence=RepositoryDispatchPersistence(...)",
+        DeprecationWarning,
+        stacklevel=3,
+    )
+    return RepositoryDispatchPersistence(
+        attempt_repo=attempt_repo,
+        provider_call_repo=provider_call_repo,
+    )
+
+
+async def _call_provider(
+    *,
+    provider: ProviderProtocol | LegacyGenerateProviderProtocol,
+    request: ProviderRequest,
+) -> ProviderResponse:
+    if isinstance(provider, ProviderProtocol):
+        return await provider.send(request)
+
+    if isinstance(provider, LegacyGenerateProviderProtocol):
+        warnings.warn(
+            "provider.generate(...) is deprecated; implement provider.send(...)",
+            DeprecationWarning,
+            stacklevel=3,
+        )
+        return await provider.generate(request)
+
+    raise TypeError("provider must implement send(request)")
+
+
+def _usage_total_tokens(usage: ProviderUsage) -> int:
+    if usage.total_tokens > 0:
+        return usage.total_tokens
+    derived_total = usage.input_tokens + usage.output_tokens
+    if derived_total > 0:
+        return derived_total
+    return 0
+
+
+def _usage_cost_usd(usage: ProviderUsage) -> float:
+    if usage.cost_estimate_usd is None:
+        return 0.0
+    return usage.cost_estimate_usd
 
 
 def _derive_dispatch_idempotency_key(request: DispatchRequest) -> str:
@@ -1046,6 +1122,7 @@ def _truncate_feedback(message: str | None) -> str | None:
 __all__ = [
     "AttemptRepoLike",
     "BudgetExceededError",
+    "DispatchPersistenceProtocol",
     "DeterministicRateLimiter",
     "DispatchBudget",
     "DispatchController",
@@ -1056,9 +1133,11 @@ __all__ = [
     "ProviderBinding",
     "ProviderCallError",
     "ProviderCallRepoLike",
+    "ProviderError",
     "ProviderProtocol",
     "ProviderRequest",
     "ProviderResponse",
     "ProviderUsage",
+    "RepositoryDispatchPersistence",
     "TranscriptEntry",
 ]

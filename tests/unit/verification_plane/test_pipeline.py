@@ -297,6 +297,51 @@ async def test_incremental_vs_full_selection_hooks_and_artifact_payloads() -> No
     )
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("risk_tier", [RiskTier.HIGH, RiskTier.CRITICAL])
+async def test_high_and_critical_risk_cannot_silently_skip_adversarial_stage(
+    risk_tier: RiskTier,
+) -> None:
+    def deselect_adversarial(
+        stage: PipelineStage,
+        _context: PipelineSelectionContext,
+    ) -> tuple[str, ...]:
+        if stage.stage_id == ADVERSARIAL_STAGE_ID:
+            return ()
+        return stage.checker_ids
+
+    async def pass_checker(_: CheckerContext) -> dict[str, object]:
+        return {"status": "pass"}
+
+    engine = VerificationPipelineEngine(
+        checkers={
+            "build_checker": pass_checker,
+            "lint_checker": pass_checker,
+            "typecheck_checker": pass_checker,
+            "test_checker": pass_checker,
+            "security_checker": pass_checker,
+            "performance_checker": pass_checker,
+            "adversarial/test_generator": pass_checker,
+        },
+        incremental_selection_hook=deselect_adversarial,
+    )
+
+    result = await engine.run(
+        PipelineRequest(
+            risk_tier=risk_tier,
+            selection_mode=VerificationSelectionMode.INCREMENTAL,
+        )
+    )
+
+    stage_by_id = {stage.stage_id: stage for stage in result.stage_results}
+    adversarial_stage = stage_by_id[ADVERSARIAL_STAGE_ID]
+    assert adversarial_stage.skipped
+    assert adversarial_stage.skip_reason == "no_checkers_selected"
+    assert adversarial_stage.must_failure
+    assert ADVERSARIAL_STAGE_ID in result.must_failure_stage_ids
+    assert not result.passed
+
+
 def test_risk_tier_stage_mapping_matches_verification_pipeline_spec() -> None:
     engine = VerificationPipelineEngine(checkers={})
 

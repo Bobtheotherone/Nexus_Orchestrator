@@ -31,6 +31,7 @@ from dataclasses import dataclass, field
 from typing import Protocol, TypeAlias, TypeVar, cast, runtime_checkable
 
 from nexus_orchestrator.security.redaction import redact_text
+from nexus_orchestrator.synthesis_plane.model_catalog import ModelCatalog, load_model_catalog
 
 JSONScalar: TypeAlias = str | int | float | bool | None
 JSONValue: TypeAlias = JSONScalar | list["JSONValue"] | dict[str, "JSONValue"]
@@ -169,6 +170,130 @@ class ToolDefinition:
 
 
 @dataclass(frozen=True, slots=True)
+class StructuredOutputDefinition:
+    """Structured output contract exposed to providers."""
+
+    name: str
+    json_schema: Mapping[str, JSONValue] = field(default_factory=dict)
+    strict: bool = True
+    description: str | None = None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "name",
+            _validate_non_empty_str(self.name, "StructuredOutputDefinition.name"),
+        )
+        object.__setattr__(
+            self,
+            "json_schema",
+            _coerce_json_mapping(
+                dict(self.json_schema),
+                path="StructuredOutputDefinition.json_schema",
+            ),
+        )
+        object.__setattr__(self, "strict", bool(self.strict))
+        object.__setattr__(
+            self,
+            "description",
+            _validate_optional_str(
+                self.description,
+                "StructuredOutputDefinition.description",
+                strip=False,
+            ),
+        )
+
+    def to_dict(self) -> dict[str, JSONValue]:
+        payload: dict[str, JSONValue] = {
+            "name": self.name,
+            "json_schema": dict(self.json_schema),
+            "strict": self.strict,
+        }
+        if self.description is not None:
+            payload["description"] = self.description
+        return payload
+
+
+@dataclass(frozen=True, slots=True)
+class RemoteMCPToolConfig:
+    """Remote MCP server configuration for provider-hosted tool execution."""
+
+    server_label: str
+    server_url: str
+    allowed_tools: tuple[str, ...] = ()
+    require_approval: str | None = None
+    headers: Mapping[str, str] = field(default_factory=dict)
+    authorization_token_env: str | None = None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "server_label",
+            _validate_non_empty_str(self.server_label, "RemoteMCPToolConfig.server_label"),
+        )
+        object.__setattr__(
+            self,
+            "server_url",
+            _validate_non_empty_str(self.server_url, "RemoteMCPToolConfig.server_url"),
+        )
+
+        normalized_tools: list[str] = []
+        for index, tool_name in enumerate(self.allowed_tools):
+            normalized_tools.append(
+                _validate_non_empty_str(
+                    tool_name,
+                    f"RemoteMCPToolConfig.allowed_tools[{index}]",
+                )
+            )
+        object.__setattr__(self, "allowed_tools", tuple(normalized_tools))
+
+        object.__setattr__(
+            self,
+            "require_approval",
+            _validate_optional_str(
+                self.require_approval,
+                "RemoteMCPToolConfig.require_approval",
+            ),
+        )
+
+        normalized_headers: dict[str, str] = {}
+        for key, value in self.headers.items():
+            if not isinstance(key, str):
+                raise TypeError("RemoteMCPToolConfig.headers keys must be strings")
+            if not isinstance(value, str):
+                raise TypeError("RemoteMCPToolConfig.headers values must be strings")
+            normalized_key = _validate_non_empty_str(
+                key,
+                "RemoteMCPToolConfig.headers key",
+                strip=False,
+            )
+            normalized_headers[normalized_key] = value
+        object.__setattr__(self, "headers", normalized_headers)
+
+        object.__setattr__(
+            self,
+            "authorization_token_env",
+            _validate_optional_str(
+                self.authorization_token_env,
+                "RemoteMCPToolConfig.authorization_token_env",
+            ),
+        )
+
+    def to_dict(self) -> dict[str, JSONValue]:
+        payload: dict[str, JSONValue] = {
+            "server_label": self.server_label,
+            "server_url": self.server_url,
+            "allowed_tools": list(self.allowed_tools),
+            "headers": dict(self.headers),
+        }
+        if self.require_approval is not None:
+            payload["require_approval"] = self.require_approval
+        if self.authorization_token_env is not None:
+            payload["authorization_token_env"] = self.authorization_token_env
+        return payload
+
+
+@dataclass(frozen=True, slots=True)
 class ToolCall:
     """Normalized tool call emitted by providers."""
 
@@ -281,6 +406,10 @@ class ProviderRequest:
     context_docs: tuple[ContextDocument, ...]
     tool_permissions: tuple[ToolDefinition, ...]
     requested_tools: tuple[str, ...]
+    reasoning_effort: str | None
+    tool_choice: str | None
+    remote_mcp_tools: tuple[RemoteMCPToolConfig, ...]
+    structured_output: StructuredOutputDefinition | None
     idempotency_key: str | None
     budget: BudgetSnapshot | None
     metadata: Mapping[str, JSONValue]
@@ -297,6 +426,10 @@ class ProviderRequest:
         context_docs: Sequence[ContextDocument] = (),
         tool_permissions: Sequence[ToolDefinition] = (),
         requested_tools: Sequence[str] = (),
+        reasoning_effort: str | None = None,
+        tool_choice: str | None = None,
+        remote_mcp_tools: Sequence[RemoteMCPToolConfig] = (),
+        structured_output: StructuredOutputDefinition | None = None,
         idempotency_key: str | None = None,
         budget: BudgetSnapshot | None = None,
         metadata: Mapping[str, object] | None = None,
@@ -307,6 +440,9 @@ class ProviderRequest:
         tools: Sequence[ToolDefinition] | None = None,
         allow_tool_calls: bool | None = None,
         max_output_tokens: int | None = None,
+        structured_output_schema: Mapping[str, object] | None = None,
+        structured_output_name: str | None = None,
+        structured_output_strict: bool = True,
     ) -> None:
         self.model = _validate_non_empty_str(model, "ProviderRequest.model")
 
@@ -350,6 +486,45 @@ class ProviderRequest:
                 _validate_non_empty_str(item, f"ProviderRequest.requested_tools[{index}]")
             )
         self.requested_tools = tuple(normalized_requested_tools)
+        self.reasoning_effort = _validate_optional_str(
+            reasoning_effort,
+            "ProviderRequest.reasoning_effort",
+        )
+        self.tool_choice = _validate_optional_str(tool_choice, "ProviderRequest.tool_choice")
+
+        normalized_remote_mcp: list[RemoteMCPToolConfig] = []
+        for index, server in enumerate(remote_mcp_tools):
+            if not isinstance(server, RemoteMCPToolConfig):
+                raise TypeError(
+                    f"ProviderRequest.remote_mcp_tools[{index}] must be RemoteMCPToolConfig"
+                )
+            normalized_remote_mcp.append(server)
+        self.remote_mcp_tools = tuple(normalized_remote_mcp)
+
+        resolved_structured_output = structured_output
+        if resolved_structured_output is not None and structured_output_schema is not None:
+            raise ValueError(
+                "Provide either structured_output or structured_output_schema, not both"
+            )
+        if resolved_structured_output is None and structured_output_schema is not None:
+            resolved_name = (
+                structured_output_name
+                if structured_output_name is not None
+                else f"{self.role_id}_output"
+            )
+            resolved_structured_output = StructuredOutputDefinition(
+                name=resolved_name,
+                json_schema=_coerce_json_mapping(
+                    dict(structured_output_schema),
+                    path="ProviderRequest.structured_output_schema",
+                ),
+                strict=structured_output_strict,
+            )
+        if resolved_structured_output is not None and not isinstance(
+            resolved_structured_output, StructuredOutputDefinition
+        ):
+            raise TypeError("ProviderRequest.structured_output must be StructuredOutputDefinition")
+        self.structured_output = resolved_structured_output
 
         self.idempotency_key = _validate_optional_str(
             idempotency_key,
@@ -412,8 +587,15 @@ class ProviderRequest:
             "context_docs": [doc.to_dict() for doc in self.context_docs],
             "tool_permissions": [tool.to_dict() for tool in self.tool_permissions],
             "requested_tools": list(self.requested_tools),
+            "remote_mcp_tools": [tool.to_dict() for tool in self.remote_mcp_tools],
             "metadata": dict(self.metadata),
         }
+        if self.reasoning_effort is not None:
+            payload["reasoning_effort"] = self.reasoning_effort
+        if self.tool_choice is not None:
+            payload["tool_choice"] = self.tool_choice
+        if self.structured_output is not None:
+            payload["structured_output"] = self.structured_output.to_dict()
         if self.temperature is not None:
             payload["temperature"] = self.temperature
         if self.max_tokens is not None:
@@ -518,44 +700,45 @@ class BaseProvider(abc.ABC):
 
     provider_name: str = "provider"
 
-    _MODEL_CONTEXT_LIMITS: Mapping[str, int] = {
-        "gpt-5-codex": 128_000,
-        "gpt-4.1": 128_000,
-        "claude-sonnet-4-5": 200_000,
-        "claude-opus-4-6": 200_000,
-    }
-    _MODEL_COST_PER_1K_TOKENS_USD: Mapping[str, float] = {
-        "gpt-5-codex": 0.006,
-        "gpt-4.1": 0.010,
-        "claude-sonnet-4-5": 0.008,
-        "claude-opus-4-6": 0.020,
-    }
+    def __init__(self, *, model_catalog: ModelCatalog | None = None) -> None:
+        self._model_catalog = model_catalog if model_catalog is not None else load_model_catalog()
 
     @abc.abstractmethod
     async def send(self, request: ProviderRequest) -> ProviderResponse:
         """Send one provider request and return a normalized response."""
 
     def supports_tool_calling(self, model: str) -> bool:
-        _ = _validate_non_empty_str(model, "model")
-        return True
+        normalized = _validate_non_empty_str(model, "model")
+        try:
+            return self._model_catalog.supports_tool_calling(
+                provider=self.provider_name,
+                model=normalized,
+            )
+        except KeyError:
+            return True
 
     def max_context_tokens(self, model: str) -> int:
         normalized = _validate_non_empty_str(model, "model")
-        for key, value in self._MODEL_CONTEXT_LIMITS.items():
-            if normalized.startswith(key):
-                return value
-        return 128_000
+        try:
+            return self._model_catalog.max_context_tokens(
+                provider=self.provider_name,
+                model=normalized,
+            )
+        except KeyError:
+            return 128_000
 
     def estimate_cost(self, tokens: int, model: str) -> float:
         if tokens < 0:
             raise ValueError("tokens must be >= 0")
         normalized = _validate_non_empty_str(model, "model")
-        cost_per_1k = 0.010
-        for key, value in self._MODEL_COST_PER_1K_TOKENS_USD.items():
-            if normalized.startswith(key):
-                cost_per_1k = value
-                break
-        return (tokens / 1000.0) * cost_per_1k
+        try:
+            return self._model_catalog.estimate_cost(
+                provider=self.provider_name,
+                model=normalized,
+                total_tokens=tokens,
+            )
+        except KeyError:
+            return (tokens / 1000.0) * 0.010
 
 
 @runtime_checkable
@@ -739,9 +922,14 @@ def provider_error_subclasses() -> tuple[type[ProviderError], ...]:
         current = pending.pop()
         discovered.add(current)
         pending.extend(current.__subclasses__())
+    scoped = tuple(
+        error_type
+        for error_type in discovered
+        if error_type.__module__.startswith("nexus_orchestrator.synthesis_plane.providers")
+    )
     return tuple(
         sorted(
-            discovered,
+            scoped,
             key=lambda error_type: (error_type.__module__, error_type.__qualname__),
         )
     )
@@ -1025,8 +1213,10 @@ __all__ = [
     "ProviderUnavailableError",
     "ProviderUsage",
     "RandomFn",
+    "RemoteMCPToolConfig",
     "RedactedTranscript",
     "SleepFn",
+    "StructuredOutputDefinition",
     "ToolCall",
     "ToolDefinition",
     "compute_backoff_delay",

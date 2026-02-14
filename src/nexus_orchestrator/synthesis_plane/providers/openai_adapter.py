@@ -23,11 +23,12 @@ from __future__ import annotations
 
 import asyncio
 import importlib
+import json
 import os
 import random as random_module
 import time
-from collections.abc import Mapping, Sequence
-from typing import Protocol, cast
+from collections.abc import Callable, Mapping, Sequence
+from typing import TYPE_CHECKING, Protocol, cast
 
 from nexus_orchestrator.synthesis_plane.providers.base import (
     BackoffConfig,
@@ -46,6 +47,7 @@ from nexus_orchestrator.synthesis_plane.providers.base import (
     ProviderUnavailableError,
     ProviderUsage,
     RandomFn,
+    RemoteMCPToolConfig,
     SleepFn,
     ToolCall,
     ToolDefinition,
@@ -53,6 +55,9 @@ from nexus_orchestrator.synthesis_plane.providers.base import (
     parse_tool_arguments,
     run_with_retries,
 )
+
+if TYPE_CHECKING:
+    from nexus_orchestrator.synthesis_plane.model_catalog import ModelCatalog
 
 
 class _OpenAIResponsesAPI(Protocol):
@@ -73,6 +78,7 @@ class OpenAIProvider(BaseProvider):
         *,
         model: str,
         api_key: str | None = None,
+        api_key_env: str | None = None,
         base_url: str | None = None,
         organization: str | None = None,
         timeout_seconds: float | None = None,
@@ -80,9 +86,12 @@ class OpenAIProvider(BaseProvider):
         backoff: BackoffConfig | None = None,
         sleep: SleepFn = asyncio.sleep,
         random_fn: RandomFn = random_module.random,
+        model_catalog: ModelCatalog | None = None,
     ) -> None:
+        super().__init__(model_catalog=model_catalog)
         self.model = _validate_non_empty_str(model, "model")
         self._api_key = _validate_optional_str(api_key, "api_key")
+        self._api_key_env = _validate_optional_str(api_key_env, "api_key_env")
         self._base_url = _validate_optional_str(base_url, "base_url")
         self._organization = _validate_optional_str(organization, "organization")
 
@@ -131,22 +140,13 @@ class OpenAIProvider(BaseProvider):
         )
 
     def supports_tool_calling(self, model: str) -> bool:
-        _ = _validate_non_empty_str(model, "model")
-        return True
+        return super().supports_tool_calling(model)
 
     def max_context_tokens(self, model: str) -> int:
-        normalized = _validate_non_empty_str(model, "model")
-        if normalized.startswith("gpt-5"):
-            return 200_000
-        return 128_000
+        return super().max_context_tokens(model)
 
     def estimate_cost(self, tokens: int, model: str) -> float:
-        normalized = _validate_non_empty_str(model, "model")
-        if normalized.startswith("gpt-5"):
-            return (tokens / 1000.0) * 0.004
-        if normalized.startswith("gpt-4.1"):
-            return (tokens / 1000.0) * 0.010
-        return super().estimate_cost(tokens, normalized)
+        return super().estimate_cost(tokens, model)
 
     def _ensure_client(self) -> _OpenAIClient:
         if self._client is not None:
@@ -170,13 +170,7 @@ class OpenAIProvider(BaseProvider):
                 detail="openai SDK does not expose AsyncOpenAI",
             )
 
-        api_key = self._api_key or os.getenv("OPENAI_API_KEY") or os.getenv("NEXUS_OPENAI_API_KEY")
-        if api_key is None:
-            raise ProviderAuthenticationError(
-                provider=self.provider_name,
-                detail="missing OpenAI API key; set OPENAI_API_KEY or NEXUS_OPENAI_API_KEY",
-                http_status=401,
-            )
+        api_key = self._resolve_api_key()
 
         init_kwargs: dict[str, object] = {"api_key": api_key}
         if self._base_url is not None:
@@ -193,6 +187,29 @@ class OpenAIProvider(BaseProvider):
                 detail="openai client missing responses API",
             )
         return cast("_OpenAIClient", client)
+
+    def _resolve_api_key(self) -> str:
+        if self._api_key is not None:
+            return self._api_key
+
+        if self._api_key_env is not None:
+            configured = os.getenv(self._api_key_env)
+            if configured is None or not configured.strip():
+                raise ProviderAuthenticationError(
+                    provider=self.provider_name,
+                    detail=f"missing OpenAI API key in configured env var {self._api_key_env}",
+                    http_status=401,
+                )
+            return configured
+
+        fallback_key = os.getenv("OPENAI_API_KEY") or os.getenv("NEXUS_OPENAI_API_KEY")
+        if fallback_key is None or not fallback_key.strip():
+            raise ProviderAuthenticationError(
+                provider=self.provider_name,
+                detail="missing OpenAI API key; set OPENAI_API_KEY or NEXUS_OPENAI_API_KEY",
+                http_status=401,
+            )
+        return fallback_key
 
     async def _create_response(
         self,
@@ -225,9 +242,35 @@ class OpenAIProvider(BaseProvider):
             payload["temperature"] = request.temperature
         if request.max_tokens is not None:
             payload["max_output_tokens"] = request.max_tokens
+        if request.reasoning_effort is not None:
+            payload["reasoning"] = {"effort": request.reasoning_effort}
 
+        tools: list[dict[str, object]] = []
         if request.tool_permissions:
-            payload["tools"] = [_tool_definition_payload(tool) for tool in request.tool_permissions]
+            tools.extend(_tool_definition_payload(tool) for tool in request.tool_permissions)
+        if request.remote_mcp_tools:
+            tools.extend(_remote_mcp_tool_payload(tool) for tool in request.remote_mcp_tools)
+        if tools:
+            payload["tools"] = tools
+
+        if request.tool_choice is not None:
+            payload["tool_choice"] = request.tool_choice
+        elif request.requested_tools:
+            payload["tool_choice"] = {
+                "type": "allowed_tools",
+                "allowed_tools": list(request.requested_tools),
+            }
+
+        if request.structured_output is not None:
+            format_payload: dict[str, object] = {
+                "type": "json_schema",
+                "name": request.structured_output.name,
+                "schema": dict(request.structured_output.json_schema),
+                "strict": bool(request.structured_output.strict),
+            }
+            if request.structured_output.description is not None:
+                format_payload["description"] = request.structured_output.description
+            payload["text"] = {"format": format_payload}
 
         return payload
 
@@ -240,21 +283,30 @@ class OpenAIProvider(BaseProvider):
         latency_ms: int,
         idempotency_header_sent: bool,
     ) -> ProviderResponse:
-        raw_text, tool_calls = _extract_openai_output(raw_response)
+        raw_text, tool_calls, structured_output = _extract_openai_output(raw_response)
         model_value = _read_str(raw_response, "model") or request.model
         request_id = _read_str(raw_response, "id") or _read_str(raw_response, "request_id")
 
         usage = _normalize_usage(raw_response)
+        total_tokens = usage.total_tokens
+        if total_tokens == 0:
+            total_tokens = usage.input_tokens + usage.output_tokens
+        estimated_cost = _estimate_cost_from_catalog(
+            provider=self.provider_name,
+            model_catalog=self._model_catalog,
+            model=model_value,
+            total_tokens=total_tokens,
+            input_tokens=usage.input_tokens,
+            output_tokens=usage.output_tokens,
+            fallback=self.estimate_cost,
+        )
         if usage.total_tokens == 0:
             usage = ProviderUsage(
                 input_tokens=usage.input_tokens,
                 output_tokens=usage.output_tokens,
-                total_tokens=usage.input_tokens + usage.output_tokens,
+                total_tokens=total_tokens,
                 latency_ms=latency_ms,
-                cost_estimate_usd=self.estimate_cost(
-                    usage.input_tokens + usage.output_tokens,
-                    model_value,
-                ),
+                cost_estimate_usd=estimated_cost,
             )
         else:
             usage = ProviderUsage(
@@ -262,7 +314,7 @@ class OpenAIProvider(BaseProvider):
                 output_tokens=usage.output_tokens,
                 total_tokens=usage.total_tokens,
                 latency_ms=latency_ms,
-                cost_estimate_usd=self.estimate_cost(usage.total_tokens, model_value),
+                cost_estimate_usd=estimated_cost,
             )
 
         finish_reason: str | None = None
@@ -282,6 +334,7 @@ class OpenAIProvider(BaseProvider):
             model=model_value,
             raw_text=raw_text,
             usage=usage,
+            structured_output=structured_output,
             tool_calls=tool_calls,
             request_id=request_id,
             idempotency_key=idempotency_key,
@@ -364,6 +417,10 @@ def _normalize_request(request: ProviderRequest, *, default_model: str) -> Provi
         context_docs=request.context_docs,
         tool_permissions=request.tool_permissions,
         requested_tools=request.requested_tools,
+        reasoning_effort=request.reasoning_effort,
+        tool_choice=request.tool_choice,
+        remote_mcp_tools=request.remote_mcp_tools,
+        structured_output=request.structured_output,
         max_tokens=request.max_tokens,
         temperature=request.temperature,
         idempotency_key=request.idempotency_key,
@@ -398,9 +455,33 @@ def _tool_definition_payload(tool: ToolDefinition) -> dict[str, object]:
     return out
 
 
-def _extract_openai_output(raw_response: object) -> tuple[str, tuple[ToolCall, ...]]:
+def _remote_mcp_tool_payload(tool: RemoteMCPToolConfig) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "type": "mcp",
+        "server_label": tool.server_label,
+        "server_url": tool.server_url,
+    }
+    if tool.allowed_tools:
+        payload["allowed_tools"] = list(tool.allowed_tools)
+    if tool.require_approval is not None:
+        payload["require_approval"] = tool.require_approval
+
+    headers = dict(tool.headers)
+    if tool.authorization_token_env is not None:
+        token_value = os.getenv(tool.authorization_token_env)
+        if token_value is not None and token_value.strip():
+            headers["Authorization"] = f"Bearer {token_value}"
+    if headers:
+        payload["headers"] = headers
+    return payload
+
+
+def _extract_openai_output(
+    raw_response: object,
+) -> tuple[str, tuple[ToolCall, ...], JSONValue | None]:
     text_chunks: list[str] = []
     tool_calls: list[ToolCall] = []
+    structured_output = _extract_openai_structured_output(raw_response)
 
     direct_output = _read_str(raw_response, "output_text")
     if direct_output:
@@ -417,6 +498,14 @@ def _extract_openai_output(raw_response: object) -> tuple[str, tuple[ToolCall, .
                     text_value = _read_str(content_part, "text") or _read_str(content_part, "value")
                     if text_value:
                         text_chunks.append(text_value)
+                elif content_type in {"output_json", "json"}:
+                    parsed = _coerce_structured_candidate(
+                        _read_value(
+                            content_part, "json", default=_read_value(content_part, "value")
+                        )
+                    )
+                    if parsed is not None:
+                        structured_output = parsed
                 elif content_type in {"function_call", "tool_call"}:
                     tool_calls.append(
                         _normalize_openai_tool_call(content_part, len(tool_calls) + 1)
@@ -424,6 +513,12 @@ def _extract_openai_output(raw_response: object) -> tuple[str, tuple[ToolCall, .
 
         elif item_type in {"function_call", "tool_call"}:
             tool_calls.append(_normalize_openai_tool_call(item, len(tool_calls) + 1))
+        elif item_type in {"output_json", "json"}:
+            parsed = _coerce_structured_candidate(
+                _read_value(item, "json", default=_read_value(item, "value"))
+            )
+            if parsed is not None:
+                structured_output = parsed
 
     choices = _read_sequence(raw_response, "choices")
     for choice in choices:
@@ -431,18 +526,116 @@ def _extract_openai_output(raw_response: object) -> tuple[str, tuple[ToolCall, .
         message_content = _read_str(message, "content")
         if message_content:
             text_chunks.append(message_content)
+        parsed_choice = _coerce_structured_candidate(
+            _read_value(message, "parsed", default=_read_value(choice, "parsed"))
+        )
+        if parsed_choice is not None:
+            structured_output = parsed_choice
 
         for raw_tool_call in _read_sequence(message, "tool_calls"):
             tool_calls.append(_normalize_openai_tool_call(raw_tool_call, len(tool_calls) + 1))
 
     combined_text = "\n".join(chunk for chunk in text_chunks if chunk.strip())
-    if not combined_text and not tool_calls:
+    if structured_output is None and _looks_like_json_document(combined_text):
+        parsed_text = _coerce_structured_candidate(combined_text)
+        if parsed_text is not None:
+            structured_output = parsed_text
+
+    if not combined_text and not tool_calls and structured_output is None:
         raise ProviderResponseError(
             provider="openai",
             detail="response does not contain text or tool calls",
         )
 
-    return combined_text, tuple(tool_calls)
+    return combined_text, tuple(tool_calls), structured_output
+
+
+def _extract_openai_structured_output(raw_response: object) -> JSONValue | None:
+    direct_candidates = (
+        _read_value(raw_response, "output_parsed"),
+        _read_value(raw_response, "parsed"),
+        _read_value(raw_response, "structured_output"),
+    )
+    for candidate in direct_candidates:
+        parsed = _coerce_structured_candidate(candidate)
+        if parsed is not None:
+            return parsed
+
+    for output_item in _read_sequence(raw_response, "output"):
+        parsed = _coerce_structured_candidate(
+            _read_value(
+                output_item,
+                "parsed",
+                default=_read_value(output_item, "json", default=_read_value(output_item, "value")),
+            )
+        )
+        if parsed is not None:
+            return parsed
+
+        for content_part in _read_sequence(output_item, "content"):
+            parsed = _coerce_structured_candidate(
+                _read_value(
+                    content_part,
+                    "parsed",
+                    default=_read_value(
+                        content_part,
+                        "json",
+                        default=_read_value(content_part, "value"),
+                    ),
+                )
+            )
+            if parsed is not None:
+                return parsed
+
+    return None
+
+
+def _coerce_structured_candidate(candidate: object) -> JSONValue | None:
+    if candidate is None:
+        return None
+    if isinstance(candidate, bool):
+        return candidate
+    if isinstance(candidate, int):
+        return candidate
+    if isinstance(candidate, float):
+        return candidate
+    if isinstance(candidate, str):
+        stripped = candidate.strip()
+        if not stripped:
+            return None
+        if _looks_like_json_document(stripped):
+            try:
+                parsed = json.loads(stripped)
+            except json.JSONDecodeError:
+                return stripped
+            return _coerce_structured_candidate(parsed)
+        return stripped
+    if isinstance(candidate, Mapping):
+        out: dict[str, JSONValue] = {}
+        for key, value in candidate.items():
+            if not isinstance(key, str):
+                return None
+            normalized = _coerce_structured_candidate(value)
+            if normalized is None and value is not None:
+                return None
+            out[key] = normalized
+        return out
+    if isinstance(candidate, Sequence) and not isinstance(candidate, (str, bytes, bytearray)):
+        out_list: list[JSONValue] = []
+        for item in candidate:
+            normalized = _coerce_structured_candidate(item)
+            if normalized is None and item is not None:
+                return None
+            out_list.append(normalized)
+        return out_list
+    return None
+
+
+def _looks_like_json_document(value: str) -> bool:
+    stripped = value.strip()
+    if not stripped:
+        return False
+    return stripped.startswith("{") or stripped.startswith("[")
 
 
 def _normalize_openai_tool_call(raw_call: object, index: int) -> ToolCall:
@@ -489,6 +682,28 @@ def _normalize_usage(raw_response: object) -> ProviderUsage:
         output_tokens=output_tokens,
         total_tokens=total_tokens,
     )
+
+
+def _estimate_cost_from_catalog(
+    *,
+    provider: str,
+    model_catalog: ModelCatalog,
+    model: str,
+    total_tokens: int,
+    input_tokens: int,
+    output_tokens: int,
+    fallback: Callable[[int, str], float],
+) -> float:
+    try:
+        return model_catalog.estimate_cost(
+            provider=provider,
+            model=model,
+            total_tokens=total_tokens,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+        )
+    except KeyError:
+        return float(fallback(total_tokens, model))
 
 
 def _exception_detail(exc: BaseException) -> str:
