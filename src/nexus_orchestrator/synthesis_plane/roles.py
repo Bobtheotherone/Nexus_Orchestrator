@@ -553,18 +553,31 @@ class RoleRegistry:
         )
 
     @classmethod
-    def default(cls, *, model_catalog: ModelCatalog | None = None) -> RoleRegistry:
+    def default(
+        cls,
+        *,
+        model_catalog: ModelCatalog | None = None,
+        default_provider: str = "anthropic",
+    ) -> RoleRegistry:
         catalog = model_catalog if model_catalog is not None else load_model_catalog()
         profile_models = _resolve_provider_profile_models(config=None, model_catalog=catalog)
         return cls(
-            roles=_default_roles(profile_models=profile_models),
+            roles=_default_roles(profile_models=profile_models, default_provider=default_provider),
             risk_tier_requirements=_default_risk_tier_requirements(),
         )
 
     @classmethod
     def from_config(cls, config: Mapping[str, object] | None) -> RoleRegistry:
         model_catalog = load_model_catalog()
-        registry = cls.default(model_catalog=model_catalog)
+        # Extract default provider from config for ladder selection
+        default_provider = "anthropic"
+        if isinstance(config, Mapping):
+            providers_raw = config.get("providers")
+            if isinstance(providers_raw, Mapping):
+                dp = providers_raw.get("default")
+                if isinstance(dp, str) and dp:
+                    default_provider = dp
+        registry = cls.default(model_catalog=model_catalog, default_provider=default_provider)
         if config is None:
             return registry
         if not isinstance(config, Mapping):
@@ -574,7 +587,7 @@ class RoleRegistry:
             config=config, model_catalog=model_catalog
         )
         registry = cls(
-            roles=_default_roles(profile_models=profile_models),
+            roles=_default_roles(profile_models=profile_models, default_provider=default_provider),
             risk_tier_requirements=_default_risk_tier_requirements(),
         )
 
@@ -779,7 +792,7 @@ def _resolve_provider_profile_models(
     providers = providers_raw if isinstance(providers_raw, Mapping) else {}
 
     provider_models: dict[str, Mapping[str, str]] = {}
-    for provider_name in ("openai", "anthropic", "local"):
+    for provider_name in ("openai", "anthropic", "local", "tool"):
         provider_cfg_raw = providers.get(provider_name)
         provider_cfg = provider_cfg_raw if isinstance(provider_cfg_raw, Mapping) else {}
 
@@ -934,13 +947,49 @@ def _default_claude_ladder(
     )
 
 
+def _default_tool_ladder(
+    *,
+    profile_models: Mapping[str, Mapping[str, str]],
+) -> EscalationPolicy:
+    """Escalation ladder that uses local CLI tool backends (codex, claude)."""
+    return EscalationPolicy(
+        steps=(
+            EscalationStep(
+                provider="tool",
+                model=_profile_model(
+                    profile_models,
+                    provider="tool",
+                    capability_profile=_PROFILE_CODE,
+                ),
+                attempts=3,
+            ),
+            EscalationStep(
+                provider="tool",
+                model=_profile_model(
+                    profile_models,
+                    provider="tool",
+                    capability_profile=_PROFILE_ARCHITECT,
+                ),
+                attempts=2,
+            ),
+        )
+    )
+
+
 def _default_roles(
     *,
     profile_models: Mapping[str, Mapping[str, str]],
+    default_provider: str = "anthropic",
 ) -> tuple[AgentRole, ...]:
-    codex_ladder = _default_codex_ladder(profile_models=profile_models)
-    hybrid_ladder = _default_hybrid_ladder(profile_models=profile_models)
-    claude_ladder = _default_claude_ladder(profile_models=profile_models)
+    if default_provider == "tool" and "tool" in profile_models:
+        tool_ladder = _default_tool_ladder(profile_models=profile_models)
+        codex_ladder = tool_ladder
+        hybrid_ladder = tool_ladder
+        claude_ladder = tool_ladder
+    else:
+        codex_ladder = _default_codex_ladder(profile_models=profile_models)
+        hybrid_ladder = _default_hybrid_ladder(profile_models=profile_models)
+        claude_ladder = _default_claude_ladder(profile_models=profile_models)
     return (
         AgentRole(
             name=ROLE_ARCHITECT,

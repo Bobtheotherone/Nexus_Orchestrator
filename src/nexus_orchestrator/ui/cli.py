@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
+import importlib.util
 import json
 import shutil
 import sys
+import time
 from collections import Counter
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -16,6 +19,7 @@ from nexus_orchestrator.config import (
     ConfigLoadError,
     ConfigValidationError,
     assert_valid_config,
+    effective_config,
     load_config,
 )
 from nexus_orchestrator.control_plane import OrchestratorController
@@ -36,6 +40,7 @@ from nexus_orchestrator.spec_ingestion import SpecIngestError, ingest_spec
 from nexus_orchestrator.synthesis_plane.model_catalog import ModelCatalog, load_model_catalog
 from nexus_orchestrator.synthesis_plane.providers.base import ProviderError
 from nexus_orchestrator.synthesis_plane.roles import RoleRegistry
+from nexus_orchestrator.ui.render import CLIRenderer, create_renderer
 
 DEFAULT_SPEC_PATH: Final[str] = "samples/specs/minimal_design_doc.md"
 DEFAULT_STATE_DB_PATH: Final[str] = "state/nexus.sqlite"
@@ -71,12 +76,25 @@ class RoleRoutingSnapshot:
     steps: tuple[RoutingStepSnapshot, ...]
 
 
+# ---------------------------------------------------------------------------
+# Parser
+# ---------------------------------------------------------------------------
+
+
 def build_parser() -> argparse.ArgumentParser:
     """Build the argparse command router for all supported CLI workflows."""
 
     parser = argparse.ArgumentParser(
         prog="nexus",
-        description="nexus-orchestrator command interface",
+        description=(
+            "nexus-orchestrator — constraint-driven agentic LLM orchestrator.\n\n"
+            "Common workflows:\n"
+            "  nexus plan spec.md          Compile a plan from a design doc\n"
+            "  nexus run --mock            Run orchestration with mock providers\n"
+            "  nexus status                Show latest run summary + routing\n"
+            "  nexus doctor                Check environment health\n"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument(
@@ -95,17 +113,55 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Optional config profile overlay name.",
     )
+    common.add_argument(
+        "--verbose",
+        "-v",
+        action="store_true",
+        default=False,
+        help="Show detailed output.",
+    )
+    common.add_argument(
+        "--no-color",
+        action="store_true",
+        default=False,
+        help="Disable colored output (also respects NO_COLOR env var).",
+    )
 
     subparsers = parser.add_subparsers(dest="command", required=True)
 
+    # plan ----------------------------------------------------------------
     plan_parser = subparsers.add_parser(
-        "plan", parents=[common], help="Compile a deterministic plan"
+        "plan",
+        parents=[common],
+        help="Compile a deterministic plan from a spec document",
+        description=(
+            "Parse a spec/design document and compile it into work items with constraints.\n\n"
+            "Examples:\n"
+            "  nexus plan spec.md\n"
+            "  nexus plan spec.md --json\n"
+            "  nexus plan spec.md --profile strict\n"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     plan_parser.add_argument("spec_path", help="Path to the spec/design document")
     plan_parser.add_argument("--json", action="store_true", help="Emit deterministic JSON output")
     plan_parser.set_defaults(handler=_cmd_plan)
 
-    run_parser = subparsers.add_parser("run", parents=[common], help="Execute orchestration")
+    # run -----------------------------------------------------------------
+    run_parser = subparsers.add_parser(
+        "run",
+        parents=[common],
+        help="Execute orchestration",
+        description=(
+            "Run the orchestrator against a spec with real or mock providers.\n\n"
+            "Examples:\n"
+            "  nexus run --mock                     Run with mock providers (offline)\n"
+            "  nexus run spec.md --mock              Run a specific spec\n"
+            "  nexus run --resume                    Resume a crashed run\n"
+            "  nexus run --mode fresh spec.md        Force a fresh run\n"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     run_parser.add_argument(
         "spec_path",
         nargs="?",
@@ -121,20 +177,46 @@ def build_parser() -> argparse.ArgumentParser:
         default="auto",
         help="Run startup mode (default: auto)",
     )
+    run_parser.add_argument(
+        "--resume",
+        action="store_true",
+        default=False,
+        help="Resume from last run (shortcut for --mode resume)",
+    )
     run_parser.add_argument("--json", action="store_true", help="Emit deterministic JSON output")
     run_parser.set_defaults(handler=_cmd_run)
 
+    # status --------------------------------------------------------------
     status_parser = subparsers.add_parser(
-        "status", parents=[common], help="Show latest run status and routing info"
+        "status",
+        parents=[common],
+        help="Show latest run status and routing info",
+        description=(
+            "Display the latest run summary, work-item counts, budget, and routing ladder.\n\n"
+            "Examples:\n"
+            "  nexus status\n"
+            "  nexus status --json\n"
+            "  nexus status --run-id <ID>\n"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     status_parser.add_argument("--run-id", default=None, help="Inspect a specific run ID instead")
     status_parser.add_argument("--json", action="store_true", help="Emit deterministic JSON output")
     status_parser.set_defaults(handler=_cmd_status)
 
+    # inspect -------------------------------------------------------------
     inspect_parser = subparsers.add_parser(
         "inspect",
         parents=[common],
         help="Inspect a run or work item; defaults to latest run",
+        description=(
+            "Show detailed information about a run, work item, or constraint.\n\n"
+            "Examples:\n"
+            "  nexus inspect                           Inspect latest run\n"
+            "  nexus inspect <run-id>                  Inspect a specific run\n"
+            "  nexus inspect <work-item-id>            Inspect a work item\n"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     inspect_parser.add_argument("target", nargs="?", default=None, help="Run ID or work-item ID")
     inspect_parser.add_argument(
@@ -142,8 +224,19 @@ def build_parser() -> argparse.ArgumentParser:
     )
     inspect_parser.set_defaults(handler=_cmd_inspect)
 
+    # export --------------------------------------------------------------
     export_parser = subparsers.add_parser(
-        "export", parents=[common], help="Export deterministic audit bundle for a run"
+        "export",
+        parents=[common],
+        help="Export deterministic audit bundle for a run",
+        description=(
+            "Create a ZIP audit bundle with evidence, snapshots, and logs.\n\n"
+            "Examples:\n"
+            "  nexus export                         Export latest run\n"
+            "  nexus export <run-id>                Export a specific run\n"
+            "  nexus export --output bundle.zip     Export to a specific path\n"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     export_parser.add_argument(
         "run_id", nargs="?", default=None, help="Run ID (default: latest run)"
@@ -159,16 +252,127 @@ def build_parser() -> argparse.ArgumentParser:
     export_parser.add_argument("--json", action="store_true", help="Emit deterministic JSON output")
     export_parser.set_defaults(handler=_cmd_export)
 
+    # clean ---------------------------------------------------------------
     clean_parser = subparsers.add_parser(
-        "clean", parents=[common], help="Remove ephemeral state/evidence/workspaces artifacts"
+        "clean",
+        parents=[common],
+        help="Remove ephemeral state/evidence/workspaces artifacts",
+        description=(
+            "Safely remove ephemeral files. With no target flags, performs a dry run.\n\n"
+            "Examples:\n"
+            "  nexus clean                           Dry-run (show what would be removed)\n"
+            "  nexus clean --workspaces              Remove workspace directories\n"
+            "  nexus clean --state --evidence        Remove state DB and evidence\n"
+            "  nexus clean --dry-run --workspaces    Preview workspace cleanup\n"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     clean_parser.add_argument(
         "--dry-run", action="store_true", help="Show deletions without mutating"
     )
+    clean_parser.add_argument(
+        "--workspaces", action="store_true", default=False, help="Remove workspace directories"
+    )
+    clean_parser.add_argument(
+        "--state", action="store_true", default=False, help="Remove state database"
+    )
+    clean_parser.add_argument(
+        "--evidence", action="store_true", default=False, help="Remove evidence archives"
+    )
+    clean_parser.add_argument(
+        "--artifacts", action="store_true", default=False, help="Remove build artifacts"
+    )
+    clean_parser.add_argument(
+        "--evidence-older-than",
+        type=int,
+        default=None,
+        metavar="DAYS",
+        help="Only remove evidence older than DAYS days (implies --evidence)",
+    )
     clean_parser.add_argument("--json", action="store_true", help="Emit deterministic JSON output")
     clean_parser.set_defaults(handler=_cmd_clean)
 
+    # doctor --------------------------------------------------------------
+    doctor_parser = subparsers.add_parser(
+        "doctor",
+        parents=[common],
+        help="Run offline diagnostics and check environment health",
+        description=(
+            "Check config, state DB, git availability, and optional dependencies.\n\n"
+            "Examples:\n"
+            "  nexus doctor\n"
+            "  nexus doctor --json\n"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    doctor_parser.add_argument("--json", action="store_true", help="Emit JSON output")
+    doctor_parser.set_defaults(handler=_cmd_doctor)
+
+    # config --------------------------------------------------------------
+    config_parser = subparsers.add_parser(
+        "config",
+        parents=[common],
+        help="Show effective configuration (redacted)",
+        description=(
+            "Display the effective config after merging defaults, file, env, and profile.\n"
+            "Sensitive values are redacted.\n\n"
+            "Examples:\n"
+            "  nexus config\n"
+            "  nexus config --json\n"
+            "  nexus config --profile strict\n"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    config_parser.add_argument("--json", action="store_true", help="Emit JSON output")
+    config_parser.set_defaults(handler=_cmd_config)
+
+    # completion ----------------------------------------------------------
+    completion_parser = subparsers.add_parser(
+        "completion",
+        help="Generate shell completion script",
+        description=(
+            "Print a shell completion script to stdout.\n\n"
+            "Examples:\n"
+            "  nexus completion bash >> ~/.bashrc\n"
+            "  nexus completion zsh >> ~/.zshrc\n"
+            "  nexus completion fish > ~/.config/fish/completions/nexus.fish\n"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    completion_parser.add_argument(
+        "shell",
+        choices=("bash", "zsh", "fish", "powershell"),
+        help="Target shell (bash, zsh, fish, powershell)",
+    )
+    completion_parser.set_defaults(handler=_cmd_completion)
+
+    # tui -----------------------------------------------------------------
+    tui_parser = subparsers.add_parser(
+        "tui",
+        help="Launch interactive full-screen TUI dashboard",
+        description=(
+            "Launch the NEXUS interactive terminal UI.\n\n"
+            "Requires optional TUI dependencies (pip install -e '.[tui]').\n\n"
+            "Examples:\n"
+            "  nexus tui\n"
+            "  nexus tui --no-color\n"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    tui_parser.add_argument(
+        "--no-color",
+        action="store_true",
+        default=False,
+        help="Disable colored output (also respects NO_COLOR env var).",
+    )
+    tui_parser.set_defaults(handler=_cmd_tui)
+
     return parser
+
+
+# ---------------------------------------------------------------------------
+# Entrypoints
+# ---------------------------------------------------------------------------
 
 
 def run_cli(argv: Sequence[str] | None = None) -> int:
@@ -199,6 +403,11 @@ def cli_entrypoint() -> None:
     """Console-script entrypoint."""
 
     raise SystemExit(run_cli())
+
+
+# ---------------------------------------------------------------------------
+# Command handlers
+# ---------------------------------------------------------------------------
 
 
 def _cmd_plan(args: argparse.Namespace) -> int:
@@ -253,23 +462,45 @@ def _cmd_plan(args: argparse.Namespace) -> int:
         "errors": list(compilation.errors),
     }
 
-    lines = [
-        f"Planned spec: {_display_path(spec_path, repo_root)}",
-        f"Requirements: {len(spec_map.requirements)}",
-        f"Interfaces: {len(spec_map.interfaces)}",
-        f"Work items: {len(compilation.work_items)}",
-    ]
-    if task_graph_payload is not None:
-        lines.append(f"Task graph edges: {task_graph_payload['edge_count']}")
-    if compilation.warnings:
-        lines.append("Warnings:")
-        lines.extend(f"- {warning}" for warning in compilation.warnings)
-    if compilation.errors:
-        lines.append("Errors:")
-        lines.extend(f"- {error}" for error in compilation.errors)
+    exit_code = 1 if compilation.errors else 0
 
-    _emit(payload, lines, json_mode=_flag(args, "json"))
-    return 1 if compilation.errors else 0
+    if _flag(args, "json"):
+        _emit_json(payload)
+        return exit_code
+
+    renderer = _get_renderer(args)
+    spec_display = _display_path(spec_path, repo_root)
+    renderer.kv("Planned spec", spec_display)
+    renderer.kv("Requirements", len(spec_map.requirements))
+    renderer.kv("Interfaces", len(spec_map.interfaces))
+    renderer.kv("Work items", len(compilation.work_items))
+    if task_graph_payload is not None:
+        renderer.kv("Task graph edges", task_graph_payload["edge_count"])
+
+    if compilation.work_items:
+        headers = ["ID", "TITLE", "RISK", "DEPS", "SCOPE", "CONSTRAINTS"]
+        rows = [
+            [
+                item.id,
+                _truncate(item.title, 40),
+                item.risk_tier.value,
+                str(len(item.dependencies)),
+                str(len(item.scope)),
+                str(len(item.constraint_envelope.constraints)),
+            ]
+            for item in compilation.work_items
+        ]
+        renderer.table(headers, rows, title="Work item summary:")
+
+    if compilation.warnings:
+        renderer.section("Warnings:")
+        renderer.items(list(compilation.warnings))
+    if compilation.errors:
+        renderer.section("Errors:")
+        renderer.items(list(compilation.errors))
+
+    renderer.next_steps([f"nexus run {spec_display} --mock"])
+    return exit_code
 
 
 def _cmd_run(args: argparse.Namespace) -> int:
@@ -280,6 +511,8 @@ def _cmd_run(args: argparse.Namespace) -> int:
     state_db_path = _state_db_path(config, repo_root)
 
     mode_raw = _require_str(getattr(args, "mode", None), "mode")
+    if _flag(args, "resume"):
+        mode_raw = "resume"
     mode = "run" if mode_raw == "fresh" else mode_raw
     mock = _flag(args, "mock")
 
@@ -335,21 +568,35 @@ def _cmd_run(args: argparse.Namespace) -> int:
         "state_db": _display_path(controller.state_db_path, repo_root),
     }
 
-    lines = [
-        f"Run ID: {result.run_id}",
-        f"Status: {result.status.value}",
-        f"Spec: {run_record.spec_path}",
-        f"Mock mode: {str(mock).lower()}",
-        f"Budget usage: tokens={result.budget_tokens_used} cost_usd={result.budget_cost_usd:.6f} "
-        f"provider_calls={result.provider_calls}",
-        f"Work items: {work_status_counts}",
-    ]
-    if result.warnings:
-        lines.append("Warnings:")
-        lines.extend(f"- {warning}" for warning in result.warnings)
+    exit_code = 0 if result.status is RunStatus.COMPLETED else 1
 
-    _emit(payload, lines, json_mode=_flag(args, "json"))
-    return 0 if result.status is RunStatus.COMPLETED else 1
+    if _flag(args, "json"):
+        _emit_json(payload)
+        return exit_code
+
+    renderer = _get_renderer(args)
+    renderer.kv("Run ID", result.run_id)
+    renderer.kv("Status", result.status.value)
+    renderer.kv("Spec", run_record.spec_path)
+    renderer.kv("Mock mode", str(mock).lower())
+    renderer.kv(
+        "Budget usage",
+        f"tokens={result.budget_tokens_used} cost_usd={result.budget_cost_usd:.6f} "
+        f"provider_calls={result.provider_calls}",
+    )
+    renderer.kv("Work items", work_status_counts)
+    if result.warnings:
+        renderer.section("Warnings:")
+        renderer.items(list(result.warnings))
+
+    renderer.next_steps(
+        [
+            "nexus status",
+            f"nexus inspect {result.run_id}",
+            "nexus export",
+        ]
+    )
+    return exit_code
 
 
 def _cmd_status(args: argparse.Namespace) -> int:
@@ -377,12 +624,14 @@ def _cmd_status(args: argparse.Namespace) -> int:
             "routing_ladder": ladder_payload,
             "model_catalog_warnings": list(model_warnings),
         }
-        lines = [f"No runs found in {_display_path(state_db_path, repo_root)}"]
-        lines.extend(_format_routing_lines(routing_ladder))
-        if model_warnings:
-            lines.append("Model availability warnings:")
-            lines.extend(f"- {warning}" for warning in model_warnings)
-        _emit(payload, lines, json_mode=_flag(args, "json"))
+        if _flag(args, "json"):
+            _emit_json(payload)
+            return 0
+
+        renderer = _get_renderer(args)
+        renderer.text(f"No runs found in {_display_path(state_db_path, repo_root)}")
+        _render_routing(renderer, routing_ladder, model_warnings)
+        renderer.next_steps(["nexus run --mock"])
         return 0
 
     summary = _summarize_run(
@@ -399,32 +648,37 @@ def _cmd_status(args: argparse.Namespace) -> int:
         "routing_ladder": ladder_payload,
         "model_catalog_warnings": list(model_warnings),
     }
+
+    if _flag(args, "json"):
+        _emit_json(payload)
+        return 0
+
     budget_usage = _budget_usage_from_metadata(run_record.metadata)
-
-    lines = [
-        f"Latest run: {run_record.id}",
-        f"Status: {_run_status_text(run_record.status)}",
-        f"Spec: {run_record.spec_path}",
-        f"Started: {run_record.started_at.isoformat()}",
-        (
-            f"Finished: {run_record.finished_at.isoformat()}"
-            if run_record.finished_at is not None
-            else "Finished: (in progress)"
-        ),
-        f"Work items: {summary['work_item_counts']}",
-        (
-            "Budget usage: "
-            f"tokens={budget_usage['tokens_used']} "
-            f"cost_usd={budget_usage['cost_usd']:.6f} "
-            f"provider_calls={budget_usage['provider_calls']}"
-        ),
-    ]
-    lines.extend(_format_routing_lines(routing_ladder))
-    if model_warnings:
-        lines.append("Model availability warnings:")
-        lines.extend(f"- {warning}" for warning in model_warnings)
-
-    _emit(payload, lines, json_mode=_flag(args, "json"))
+    renderer = _get_renderer(args)
+    renderer.kv("Latest run", run_record.id)
+    renderer.kv("Status", _run_status_text(run_record.status))
+    renderer.kv("Spec", run_record.spec_path)
+    renderer.kv("Started", run_record.started_at.isoformat())
+    renderer.kv(
+        "Finished",
+        run_record.finished_at.isoformat()
+        if run_record.finished_at is not None
+        else "(in progress)",
+    )
+    renderer.kv("Work items", summary["work_item_counts"])
+    renderer.kv(
+        "Budget usage",
+        f"tokens={budget_usage['tokens_used']} "
+        f"cost_usd={budget_usage['cost_usd']:.6f} "
+        f"provider_calls={budget_usage['provider_calls']}",
+    )
+    _render_routing(renderer, routing_ladder, model_warnings)
+    renderer.next_steps(
+        [
+            f"nexus inspect {run_record.id}",
+            "nexus export",
+        ]
+    )
     return 0
 
 
@@ -519,20 +773,34 @@ def _cmd_inspect(args: argparse.Namespace) -> int:
             "model_catalog_warnings": list(model_warnings),
         }
 
-        lines = [
-            f"Inspect run: {run_record.id}",
-            f"Status: {_run_status_text(run_record.status)}",
-            f"Spec: {run_record.spec_path}",
-            f"Work items: {len(work_items)}",
-            f"Incidents: {len(incidents)}",
-            f"Merges: {len(merges)}",
-        ]
-        lines.extend(_format_routing_lines(routing_ladder))
-        if model_warnings:
-            lines.append("Model availability warnings:")
-            lines.extend(f"- {warning}" for warning in model_warnings)
+        if _flag(args, "json"):
+            _emit_json(payload)
+            return 0
 
-        _emit(payload, lines, json_mode=_flag(args, "json"))
+        renderer = _get_renderer(args)
+        renderer.kv("Inspect run", run_record.id)
+        renderer.kv("Status", _run_status_text(run_record.status))
+        renderer.kv("Spec", run_record.spec_path)
+        renderer.kv("Work items", len(work_items))
+        renderer.kv("Incidents", len(incidents))
+        renderer.kv("Merges", len(merges))
+
+        if work_items and renderer.verbose:
+            headers = ["ID", "TITLE", "STATUS", "RISK", "EVIDENCE"]
+            rows = [
+                [
+                    item.id,
+                    _truncate(item.title, 40),
+                    item.status.value,
+                    item.risk_tier.value,
+                    str(len(item.evidence_ids)),
+                ]
+                for item in work_items
+            ]
+            renderer.table(headers, rows, title="Work items:")
+
+        _render_routing(renderer, routing_ladder, model_warnings)
+        renderer.next_steps([f"nexus export {run_record.id}"])
         return 0
 
     work_item = _safe_get_work_item(work_item_repo, target)
@@ -641,21 +909,19 @@ def _cmd_inspect(args: argparse.Namespace) -> int:
         "model_catalog_warnings": list(model_warnings),
     }
 
-    lines = [
-        f"Inspect work item: {work_item.id}",
-        f"Run ID: {run_id}",
-        f"Status: {work_item.status.value}",
-        f"Attempts: {len(attempts)}",
-        f"Evidence: {len(evidence)}",
-        f"Incidents: {len(incidents)}",
-        f"Merges: {len(merges)}",
-    ]
-    lines.extend(_format_routing_lines(routing_ladder))
-    if model_warnings:
-        lines.append("Model availability warnings:")
-        lines.extend(f"- {warning}" for warning in model_warnings)
+    if _flag(args, "json"):
+        _emit_json(payload)
+        return 0
 
-    _emit(payload, lines, json_mode=_flag(args, "json"))
+    renderer = _get_renderer(args)
+    renderer.kv("Inspect work item", work_item.id)
+    renderer.kv("Run ID", run_id)
+    renderer.kv("Status", work_item.status.value)
+    renderer.kv("Attempts", len(attempts))
+    renderer.kv("Evidence", len(evidence))
+    renderer.kv("Incidents", len(incidents))
+    renderer.kv("Merges", len(merges))
+    _render_routing(renderer, routing_ladder, model_warnings)
     return 0
 
 
@@ -691,48 +957,86 @@ def _cmd_export(args: argparse.Namespace) -> int:
     except (FileNotFoundError, ValueError) as exc:
         raise CLIError(str(exc), exit_code=2) from exc
 
+    bundle_sha256 = _sha256_file(bundle.bundle_path)
+
     payload: dict[str, object] = {
         "command": "export",
         "run_id": bundle.run_id,
         "bundle_path": _display_path(bundle.bundle_path, repo_root),
+        "bundle_sha256": bundle_sha256,
         "member_count": len(bundle.member_names),
         "member_names": list(bundle.member_names),
         "evidence_ids": list(bundle.evidence_ids),
     }
 
-    lines = [
-        f"Exported run: {bundle.run_id}",
-        f"Bundle path: {_display_path(bundle.bundle_path, repo_root)}",
-        f"Members: {len(bundle.member_names)}",
-        f"Evidence archives: {len(bundle.evidence_ids)}",
-    ]
+    if _flag(args, "json"):
+        _emit_json(payload)
+        return 0
 
-    _emit(payload, lines, json_mode=_flag(args, "json"))
+    renderer = _get_renderer(args)
+    renderer.kv("Exported run", bundle.run_id)
+    renderer.kv("Bundle path", _display_path(bundle.bundle_path, repo_root))
+    renderer.kv("SHA-256", bundle_sha256)
+    renderer.kv("Members", len(bundle.member_names))
+    renderer.kv("Evidence archives", len(bundle.evidence_ids))
     return 0
 
 
 def _cmd_clean(args: argparse.Namespace) -> int:
     repo_root = _repo_root(args)
     config = _load_effective_config(args)
-    dry_run = _flag(args, "dry_run")
+    explicit_dry_run = _flag(args, "dry_run")
 
     workspace_root = _path_from_config(config, ("paths", "workspace_root"), repo_root)
     evidence_root = _path_from_config(config, ("paths", "evidence_root"), repo_root)
     state_db_path = _state_db_path(config, repo_root)
     artifacts_root = (repo_root / "artifacts").resolve()
 
-    targets: list[Path] = [workspace_root, evidence_root, artifacts_root]
-    state_dir = state_db_path.parent.resolve()
-    if _is_within(state_dir, repo_root):
-        targets.append(state_dir)
-    else:
-        targets.extend(
-            [
-                state_db_path,
-                Path(f"{state_db_path}-wal"),
-                Path(f"{state_db_path}-shm"),
-            ]
-        )
+    has_workspaces = _flag(args, "workspaces")
+    has_state = _flag(args, "state")
+    has_evidence = _flag(args, "evidence")
+    has_artifacts = _flag(args, "artifacts")
+    evidence_older_than: int | None = getattr(args, "evidence_older_than", None)
+    if evidence_older_than is not None:
+        has_evidence = True
+
+    has_any_filter = has_workspaces or has_state or has_evidence or has_artifacts
+
+    # Safety: no explicit flags → auto dry-run
+    effective_dry_run = explicit_dry_run or not has_any_filter
+
+    # Build target list
+    targets: list[Path] = []
+    if has_workspaces or not has_any_filter:
+        targets.append(workspace_root)
+    if has_evidence or not has_any_filter:
+        targets.append(evidence_root)
+    if has_artifacts or not has_any_filter:
+        targets.append(artifacts_root)
+    if has_state or not has_any_filter:
+        state_dir = state_db_path.parent.resolve()
+        if _is_within(state_dir, repo_root):
+            targets.append(state_dir)
+        else:
+            targets.extend(
+                [
+                    state_db_path,
+                    Path(f"{state_db_path}-wal"),
+                    Path(f"{state_db_path}-shm"),
+                ]
+            )
+
+    # Handle --evidence-older-than: replace evidence_root with individual old files
+    if evidence_older_than is not None and isinstance(evidence_older_than, int):
+        cutoff = time.time() - (evidence_older_than * 86400)
+        targets = [t for t in targets if t.resolve() != evidence_root.resolve()]
+        if evidence_root.is_dir():
+            for item in sorted(evidence_root.iterdir()):
+                try:
+                    if item.stat().st_mtime < cutoff:
+                        targets.append(item)
+                except OSError:
+                    pass
 
     unique_targets: list[Path] = []
     seen: set[Path] = set()
@@ -758,7 +1062,7 @@ def _cmd_clean(args: argparse.Namespace) -> int:
             errors.append(f"refused to delete protected path: {rendered}")
             continue
 
-        if dry_run:
+        if effective_dry_run:
             removed.append(rendered)
             continue
 
@@ -775,24 +1079,290 @@ def _cmd_clean(args: argparse.Namespace) -> int:
 
     payload: dict[str, object] = {
         "command": "clean",
-        "dry_run": dry_run,
+        "dry_run": effective_dry_run,
         "removed": removed,
         "missing": missing,
         "errors": errors,
     }
 
-    lines = [
-        f"Clean dry_run: {str(dry_run).lower()}",
-        f"Removed: {len(removed)}",
-        f"Missing: {len(missing)}",
-        f"Errors: {len(errors)}",
-    ]
-    if errors:
-        lines.append("Error details:")
-        lines.extend(f"- {item}" for item in errors)
+    if _flag(args, "json"):
+        _emit_json(payload)
+        return 1 if errors else 0
 
-    _emit(payload, lines, json_mode=_flag(args, "json"))
+    renderer = _get_renderer(args)
+    label = "dry-run" if effective_dry_run else "clean"
+    renderer.kv(
+        f"Clean ({label})", f"removed={len(removed)} missing={len(missing)} errors={len(errors)}"
+    )
+    if effective_dry_run and not has_any_filter and not explicit_dry_run:
+        renderer.text(
+            "  (no target flags specified — showing dry-run; "
+            "use --workspaces/--state/--evidence/--artifacts to delete)"
+        )
+    if removed:
+        renderer.section("Would remove:" if effective_dry_run else "Removed:")
+        renderer.items(removed)
+    if errors:
+        renderer.section("Errors:")
+        renderer.items(errors)
+
     return 1 if errors else 0
+
+
+def _cmd_doctor(args: argparse.Namespace) -> int:
+    repo_root = _repo_root(args)
+    checks: list[tuple[str, bool, str]] = []
+
+    # 1. Config check
+    config: dict[str, object] | None = None
+    try:
+        config = _load_effective_config(args)
+        checks.append(("config", True, "loaded successfully"))
+    except CLIError as exc:
+        checks.append(("config", False, str(exc)))
+
+    # 2. State DB check
+    if config is not None:
+        try:
+            state_db_path = _state_db_path(config, repo_root)
+            if state_db_path.exists():
+                state_db = StateDB(state_db_path)
+                run_repo = RunRepo(state_db)
+                run_count = len(run_repo.list(limit=100))
+                checks.append(("state_db", True, f"readable, {run_count} run(s)"))
+            else:
+                checks.append(("state_db", True, "not yet created (will be created on first run)"))
+        except Exception as exc:  # noqa: BLE001 — doctor must never crash
+            checks.append(("state_db", False, str(exc)))
+    else:
+        checks.append(("state_db", False, "skipped (config failed)"))
+
+    # 3. Git check
+    git_path = shutil.which("git")
+    if git_path is not None:
+        checks.append(("git", True, f"found at {git_path}"))
+    else:
+        checks.append(("git", False, "not found in PATH; install git >= 2.30"))
+
+    # 4. Optional deps
+    for dep_name in ("rich", "openai", "anthropic"):
+        spec = importlib.util.find_spec(dep_name)
+        if spec is not None:
+            checks.append((f"optional:{dep_name}", True, "installed"))
+        else:
+            checks.append((f"optional:{dep_name}", True, "not installed (optional)"))
+
+    # 5. Tool backends (codex, claude CLI)
+    from nexus_orchestrator.synthesis_plane.providers.tool_detection import (
+        detect_claude_code_cli,
+        detect_codex_cli,
+    )
+
+    codex_info = detect_codex_cli()
+    if codex_info is not None:
+        ver = codex_info.version or "unknown version"
+        checks.append(("tool:codex", True, f"found at {codex_info.binary_path} ({ver})"))
+    else:
+        checks.append(
+            ("tool:codex", True, "not found (optional — install: npm i -g @openai/codex)")
+        )
+
+    claude_info = detect_claude_code_cli()
+    if claude_info is not None:
+        ver = claude_info.version or "unknown version"
+        checks.append(("tool:claude", True, f"found at {claude_info.binary_path} ({ver})"))
+    else:
+        checks.append(("tool:claude", True, "not found (optional — see claude.ai/download)"))
+
+    checks_payload: list[dict[str, object]] = [
+        {"name": name, "status": "ok" if passed else "fail", "detail": detail}
+        for name, passed, detail in checks
+    ]
+    payload: dict[str, object] = {"command": "doctor", "checks": checks_payload}
+
+    if _flag(args, "json"):
+        _emit_json(payload)
+        return 0
+
+    renderer = _get_renderer(args)
+    renderer.heading("nexus doctor")
+    for name, passed, detail in checks:
+        if passed:
+            renderer.ok(f"{name}: {detail}")
+        else:
+            renderer.fail(f"{name}: {detail}")
+
+    all_passed = all(passed for _, passed, _ in checks)
+    if all_passed:
+        renderer.text("\nAll checks passed.")
+    else:
+        renderer.text("\nSome checks failed. See details above.")
+    return 0
+
+
+def _cmd_config(args: argparse.Namespace) -> int:
+    config = _load_effective_config(args)
+    profile = _optional_str(getattr(args, "profile", None))
+    redacted = effective_config(config)
+
+    payload: dict[str, object] = {
+        "command": "config",
+        "active_profile": profile,
+        "config": redacted,
+    }
+
+    if _flag(args, "json"):
+        _emit_json(payload)
+        return 0
+
+    renderer = _get_renderer(args)
+    renderer.kv("Active profile", profile or "(default)")
+    renderer.text(json.dumps(redacted, indent=2, sort_keys=True, ensure_ascii=False))
+    return 0
+
+
+def _cmd_completion(args: argparse.Namespace) -> int:
+    shell = getattr(args, "shell", None)
+    if not isinstance(shell, str) or shell not in _COMPLETION_SCRIPTS:
+        raise CLIError(f"unsupported shell: {shell}", exit_code=2)
+    print(_COMPLETION_SCRIPTS[shell])
+    return 0
+
+
+def _cmd_tui(args: argparse.Namespace) -> int:
+    from nexus_orchestrator.ui.tui import run_tui
+
+    no_color = _flag(args, "no_color")
+    argv = ["--no-color"] if no_color else []
+    return run_tui(argv)
+
+
+# ---------------------------------------------------------------------------
+# Shell completion scripts
+# ---------------------------------------------------------------------------
+
+_COMPLETION_BASH: Final[str] = """\
+# nexus bash completion — eval "$(nexus completion bash)"
+_nexus_completion() {
+    local cur="${COMP_WORDS[COMP_CWORD]}"
+    local commands="plan run status inspect export clean doctor config completion tui"
+    if [ "$COMP_CWORD" -eq 1 ]; then
+        COMPREPLY=($(compgen -W "$commands" -- "$cur"))
+        return 0
+    fi
+    local cmd="${COMP_WORDS[1]}"
+    case "$cmd" in
+        plan)       COMPREPLY=($(compgen -f -- "$cur")) ;;
+        run)        COMPREPLY=($(compgen -W "--mock --resume --mode --json --verbose" -- "$cur")) ;;
+        status)     COMPREPLY=($(compgen -W "--run-id --json --verbose" -- "$cur")) ;;
+        inspect)    COMPREPLY=($(compgen -W "--json --verbose" -- "$cur")) ;;
+        export)     COMPREPLY=($(compgen -W "--output --json --verbose" -- "$cur")) ;;
+        clean)      COMPREPLY=($(compgen -W "--dry-run --workspaces --state --evidence --artifacts --evidence-older-than --json" -- "$cur")) ;;
+        doctor)     COMPREPLY=($(compgen -W "--json --verbose" -- "$cur")) ;;
+        config)     COMPREPLY=($(compgen -W "--json --profile --verbose" -- "$cur")) ;;
+        completion) COMPREPLY=($(compgen -W "bash zsh fish powershell" -- "$cur")) ;;
+        tui)        COMPREPLY=($(compgen -W "--no-color" -- "$cur")) ;;
+    esac
+    return 0
+}
+complete -F _nexus_completion nexus
+"""
+
+_COMPLETION_ZSH: Final[str] = """\
+#compdef nexus
+# nexus zsh completion — eval "$(nexus completion zsh)"
+_nexus() {
+    local -a commands
+    commands=(
+        'plan:Compile a deterministic plan from a spec document'
+        'run:Execute orchestration'
+        'status:Show latest run status and routing info'
+        'inspect:Inspect a run or work item'
+        'export:Export deterministic audit bundle'
+        'clean:Remove ephemeral state and artifacts'
+        'doctor:Run offline diagnostics'
+        'config:Show effective configuration'
+        'completion:Generate shell completion script'
+        'tui:Launch interactive TUI dashboard'
+    )
+    _describe 'command' commands
+}
+compdef _nexus nexus
+"""
+
+_COMPLETION_FISH: Final[str] = """\
+# nexus fish completion — nexus completion fish > ~/.config/fish/completions/nexus.fish
+complete -c nexus -n '__fish_use_subcommand' -a plan -d 'Compile a deterministic plan'
+complete -c nexus -n '__fish_use_subcommand' -a run -d 'Execute orchestration'
+complete -c nexus -n '__fish_use_subcommand' -a status -d 'Show latest run status'
+complete -c nexus -n '__fish_use_subcommand' -a inspect -d 'Inspect a run or work item'
+complete -c nexus -n '__fish_use_subcommand' -a export -d 'Export audit bundle'
+complete -c nexus -n '__fish_use_subcommand' -a clean -d 'Remove ephemeral artifacts'
+complete -c nexus -n '__fish_use_subcommand' -a doctor -d 'Run diagnostics'
+complete -c nexus -n '__fish_use_subcommand' -a config -d 'Show configuration'
+complete -c nexus -n '__fish_use_subcommand' -a completion -d 'Generate completion script'
+complete -c nexus -n '__fish_use_subcommand' -a tui -d 'Launch interactive TUI'
+"""
+
+_COMPLETION_POWERSHELL: Final[str] = """\
+# nexus PowerShell completion
+Register-ArgumentCompleter -CommandName nexus -ScriptBlock {
+    param($commandName, $wordToComplete, $cursorPosition)
+    $commands = @('plan', 'run', 'status', 'inspect', 'export', 'clean', 'doctor', 'config', 'completion', 'tui')
+    $commands | Where-Object { $_ -like "$wordToComplete*" } | ForEach-Object {
+        [System.Management.Automation.CompletionResult]::new($_, $_, 'ParameterValue', $_)
+    }
+}
+"""
+
+_COMPLETION_SCRIPTS: Final[dict[str, str]] = {
+    "bash": _COMPLETION_BASH,
+    "zsh": _COMPLETION_ZSH,
+    "fish": _COMPLETION_FISH,
+    "powershell": _COMPLETION_POWERSHELL,
+}
+
+
+# ---------------------------------------------------------------------------
+# Rendering helpers
+# ---------------------------------------------------------------------------
+
+
+def _emit_json(payload: Mapping[str, object]) -> None:
+    """Emit a JSON payload to stdout with deterministic formatting."""
+
+    print(json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False))
+
+
+def _get_renderer(args: argparse.Namespace) -> CLIRenderer:
+    """Retrieve or create a CLI renderer from the parsed namespace."""
+
+    no_color = _flag(args, "no_color")
+    verbose = _flag(args, "verbose")
+    return create_renderer(no_color=no_color, verbose=verbose)
+
+
+def _render_routing(
+    renderer: CLIRenderer,
+    snapshots: Sequence[RoleRoutingSnapshot],
+    model_warnings: Sequence[str],
+) -> None:
+    """Render routing ladder and model warnings via the given renderer."""
+
+    renderer.section("Routing ladder:")
+    for snapshot in snapshots:
+        segments = [f"{step.provider}/{step.model} x{step.attempts}" for step in snapshot.steps]
+        ladder = " -> ".join(segments)
+        state = "enabled" if snapshot.enabled else "disabled"
+        renderer.text(f"- {snapshot.role} [{state}]: {ladder}")
+    if model_warnings:
+        renderer.section("Model availability warnings:")
+        renderer.items(list(model_warnings))
+
+
+# ---------------------------------------------------------------------------
+# Helpers — config, paths, resolution
+# ---------------------------------------------------------------------------
 
 
 def _repo_root(args: argparse.Namespace) -> Path:
@@ -860,6 +1430,11 @@ def _path_from_config(
 
     candidate = Path(value).expanduser()
     return candidate.resolve() if candidate.is_absolute() else (repo_root / candidate).resolve()
+
+
+# ---------------------------------------------------------------------------
+# Helpers — routing / model catalog
+# ---------------------------------------------------------------------------
 
 
 def _build_routing_ladder(
@@ -934,14 +1509,9 @@ def _routing_payload(snapshots: Sequence[RoleRoutingSnapshot]) -> list[dict[str,
     ]
 
 
-def _format_routing_lines(snapshots: Sequence[RoleRoutingSnapshot]) -> list[str]:
-    lines = ["Routing ladder:"]
-    for snapshot in snapshots:
-        segments = [f"{step.provider}/{step.model} x{step.attempts}" for step in snapshot.steps]
-        ladder = " -> ".join(segments)
-        state = "enabled" if snapshot.enabled else "disabled"
-        lines.append(f"- {snapshot.role} [{state}]: {ladder}")
-    return lines
+# ---------------------------------------------------------------------------
+# Helpers — run / work-item resolution
+# ---------------------------------------------------------------------------
 
 
 def _resolve_status_run(run_repo: RunRepo, run_id: str | None) -> Run | None:
@@ -1049,6 +1619,11 @@ def _warning_messages_from_metadata(metadata: Mapping[str, object]) -> tuple[str
     return tuple(warnings)
 
 
+# ---------------------------------------------------------------------------
+# Helpers — file / path / formatting
+# ---------------------------------------------------------------------------
+
+
 def _is_protected_delete_target(path: Path, repo_root: Path) -> bool:
     resolved = path.resolve()
     root_path = Path(resolved.anchor)
@@ -1074,11 +1649,30 @@ def _display_path(path: Path, repo_root: Path) -> str:
     return resolved.as_posix()
 
 
-def _emit(payload: Mapping[str, object], lines: Sequence[str], *, json_mode: bool) -> None:
-    if json_mode:
-        print(json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False))
-        return
-    print("\n".join(lines))
+def _sha256_file(path: Path) -> str:
+    """Compute SHA-256 hex digest of a file."""
+
+    h = hashlib.sha256()
+    with path.open("rb") as f:
+        while True:
+            chunk = f.read(65536)
+            if not chunk:
+                break
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _truncate(text: str, max_len: int) -> str:
+    """Truncate text to max_len, appending ellipsis if needed."""
+
+    if len(text) <= max_len:
+        return text
+    return text[: max_len - 3] + "..."
+
+
+# ---------------------------------------------------------------------------
+# Helpers — argument parsing
+# ---------------------------------------------------------------------------
 
 
 def _require_str(value: object, name: str) -> str:
