@@ -109,7 +109,30 @@ def _emit_failure(exc: BaseException, exit_code: ExitCode) -> None:
     if exit_code is ExitCode.INTERNAL_ERROR:
         traceback.print_exception(type(exc), exc, exc.__traceback__, file=sys.stderr)
         return
-    _write_stderr(str(exc).strip() or exc.__class__.__name__)
+
+    message = str(exc).strip() or exc.__class__.__name__
+
+    # Provide clear remediation for provider-related failures
+    if exit_code is ExitCode.PROVIDER_ERROR:
+        if _is_provider_sdk_missing_error(exc):
+            sdk_name = getattr(exc, "name", "unknown")
+            message = (
+                f"Optional SDK '{sdk_name}' is not installed.\n"
+                f"  Install it:  pip install nexus-orchestrator[{sdk_name}]\n"
+                f"  Or use local CLI tools instead (no API key needed):\n"
+                f"    Claude Code CLI: https://claude.ai/download\n"
+                f"    Codex CLI:       npm install -g @openai/codex"
+            )
+        elif "missing" in message.lower() and "api key" in message.lower():
+            message = (
+                f"{message}\n"
+                f"\n"
+                f"Tip: You can use local CLI tools instead (no API key needed):\n"
+                f"  Claude Code CLI: run `claude` to log in\n"
+                f"  Codex CLI:       run `codex` to log in"
+            )
+
+    _write_stderr(message)
 
 
 def _write_stderr(message: str) -> None:

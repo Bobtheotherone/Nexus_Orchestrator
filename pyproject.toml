@@ -85,7 +85,12 @@ warn_return_any = true
 warn_unused_configs = true
 mypy_path = "src"
 
-exclude = ["src/nexus_orchestrator/ui/tui_app\\.py$"]
+exclude = [
+    "src/nexus_orchestrator/ui/tui_app\\.py$",
+    "src/nexus_orchestrator/ui/tui/app\\.py$",
+    "src/nexus_orchestrator/ui/tui/widgets/.*\\.py$",
+    "src/nexus_orchestrator/ui/tui/screens/.*\\.py$",
+]
 
 [[tool.mypy.overrides]]
 module = [

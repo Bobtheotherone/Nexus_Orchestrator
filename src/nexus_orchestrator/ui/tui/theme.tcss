@@ -1,0 +1,177 @@
+/* NEXUS TUI Theme — space & stars, deep black + ice blue
+ *
+ * File: src/nexus_orchestrator/ui/tui/theme.tcss
+ *
+ * Color palette:
+ *   $bg:       #05070c   (deep black background)
+ *   $panel:    #0b1020   (panel background)
+ *   $primary:  #3fa9f5   (ice blue primary)
+ *   $primary2: #72c7ff   (brighter blue)
+ *   $muted:    #7f8aa3   (muted blue-gray)
+ *   $surface:  #111830   (surface element)
+ *   $error:    #e05555   (error red)
+ *   $success:  #4ec990   (success green)
+ */
+
+$bg: #05070c;
+$panel: #0b1020;
+$primary: #3fa9f5;
+$primary2: #72c7ff;
+$muted: #7f8aa3;
+$surface: #111830;
+$error: #e05555;
+$success: #4ec990;
+
+Screen {
+    background: $bg;
+    color: $primary2;
+}
+
+/* Header */
+#header-bar {
+    dock: top;
+    height: 6;
+    background: $panel;
+    color: $primary;
+    text-style: bold;
+    padding: 0 2;
+    border-bottom: solid $primary 40%;
+}
+
+/* Main area */
+#main-area {
+    height: 1fr;
+}
+
+/* Sidebar — uses SidebarWidget.DEFAULT_CSS for inner styles */
+SidebarWidget {
+    background: $panel;
+    border-right: solid $primary 30%;
+}
+
+.sidebar-heading {
+    text-style: bold;
+    color: $primary;
+    padding: 1 0 0 0;
+    margin: 0 0 1 0;
+}
+
+.qa-button {
+    color: $primary2;
+}
+
+.qa-button:hover {
+    background: $surface;
+    color: $primary2;
+}
+
+.qa-button:focus {
+    background: $surface;
+    color: $primary;
+    text-style: bold;
+}
+
+/* Transcript area */
+#transcript-container {
+    width: 1fr;
+    height: 1fr;
+    background: $bg;
+    padding: 1 2;
+}
+
+#transcript-container:focus-within {
+    border: tall $primary 50%;
+}
+
+TranscriptWidget {
+    width: 100%;
+    height: 1fr;
+    color: $primary2;
+}
+
+/* Composer */
+Composer {
+    background: $panel;
+}
+
+#composer-input {
+    background: $surface;
+    color: $primary2;
+    border: none;
+}
+
+#composer-input:focus {
+    border: tall $primary;
+}
+
+#prompt-label {
+    color: $primary;
+}
+
+/* Status line */
+StatusLine {
+    background: $panel;
+    color: $muted;
+}
+
+/* Crash recovery banner */
+#crash-banner {
+    dock: top;
+    height: 3;
+    background: #1a1000;
+    color: #e0a040;
+    padding: 1 2;
+    border-bottom: solid #e0a040 40%;
+}
+
+#crash-banner-text {
+    width: 100%;
+}
+
+/* Onboarding styles */
+#onboarding {
+    width: 100%;
+    height: 100%;
+    background: $bg;
+    padding: 2 4;
+    align: center middle;
+}
+
+#onboard-content {
+    width: 100%;
+    height: 1fr;
+    color: $primary2;
+    padding: 1;
+}
+
+#onboard-input {
+    width: 60;
+    background: $surface;
+    color: $primary2;
+    border: tall $primary;
+}
+
+/* Splash screen styles */
+#splash {
+    width: 100%;
+    height: 100%;
+    background: $bg;
+    align: center middle;
+}
+
+#splash-scroll {
+    width: 100%;
+    height: 100%;
+    align: center middle;
+    overflow-y: auto;
+}
+
+#splash-content {
+    width: auto;
+    height: auto;
+    color: $primary2;
+    text-align: center;
+    padding: 2;
+}
+
+/* Footer (removed — keybinding hints in status line) */

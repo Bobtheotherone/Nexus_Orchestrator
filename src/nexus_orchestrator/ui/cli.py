@@ -532,7 +532,12 @@ def _cmd_run(args: argparse.Namespace) -> int:
     except ModuleNotFoundError as exc:
         if exc.name in {"openai", "anthropic"}:
             raise CLIError(
-                f"provider dependency missing: {exc.name}; install SDK or use --mock",
+                f"Optional SDK '{exc.name}' is not installed.\n"
+                f"  Install it:  pip install nexus-orchestrator[{exc.name}]\n"
+                f"  Or use --mock for offline mode.\n"
+                f"  Or use local CLI tools (no API key needed):\n"
+                f"    Claude Code CLI: https://claude.ai/download\n"
+                f"    Codex CLI:       npm install -g @openai/codex",
                 exit_code=3,
             ) from exc
         raise
@@ -1152,27 +1157,30 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
         else:
             checks.append((f"optional:{dep_name}", True, "not installed (optional)"))
 
-    # 5. Tool backends (codex, claude CLI)
-    from nexus_orchestrator.synthesis_plane.providers.tool_detection import (
-        detect_claude_code_cli,
-        detect_codex_cli,
-    )
+    # 5. Auth modes and backends (LOCAL_CLI + API_KEY)
+    from nexus_orchestrator.auth.strategy import detect_all_auth
 
-    codex_info = detect_codex_cli()
-    if codex_info is not None:
-        ver = codex_info.version or "unknown version"
-        checks.append(("tool:codex", True, f"found at {codex_info.binary_path} ({ver})"))
-    else:
-        checks.append(
-            ("tool:codex", True, "not found (optional — install: npm i -g @openai/codex)")
-        )
+    auth_statuses = detect_all_auth()
+    for status in auth_statuses:
+        label = f"auth:{status.name}"
+        mode_tag = f"[{status.auth_mode.value}]"
 
-    claude_info = detect_claude_code_cli()
-    if claude_info is not None:
-        ver = claude_info.version or "unknown version"
-        checks.append(("tool:claude", True, f"found at {claude_info.binary_path} ({ver})"))
-    else:
-        checks.append(("tool:claude", True, "not found (optional — see claude.ai/download)"))
+        if status.available:
+            if status.auth_mode.value == "local_cli":
+                ver = status.version or "unknown version"
+                path_info = f" at {status.binary_path}" if status.binary_path else ""
+                login_state = "logged in" if status.logged_in else "NOT logged in"
+                checks.append(
+                    (label, True, f"{mode_tag} {login_state}{path_info} ({ver})")
+                )
+            else:
+                checks.append(
+                    (label, True, f"{mode_tag} API key set, SDK installed")
+                )
+        else:
+            detail = status.remediation or "not available"
+            # Auth backends being unavailable is not a failure — they're optional
+            checks.append((label, True, f"{mode_tag} {detail}"))
 
     checks_payload: list[dict[str, object]] = [
         {"name": name, "status": "ok" if passed else "fail", "detail": detail}
