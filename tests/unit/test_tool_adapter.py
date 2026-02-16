@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -21,10 +22,13 @@ from nexus_orchestrator.synthesis_plane.providers.base import (
     ProviderUnavailableError,
 )
 from nexus_orchestrator.synthesis_plane.providers.tool_adapter import (
+    TOOL_MODEL_SPEC,
     ToolBackend,
     ToolProvider,
     _assemble_prompt,
-    _parse_claude_json_output,
+    _format_tool_code,
+    _parse_claude_json_fallback,
+    _parse_claude_stream_output,
 )
 
 
@@ -47,9 +51,53 @@ def _mock_process(
     stderr: str = "",
     returncode: int = 0,
 ) -> AsyncMock:
-    """Create a mock asyncio subprocess process."""
+    """Create a mock asyncio subprocess process.
+
+    The new _execute_cli reads stdout via .read() or .readline() and stderr
+    via .readline(), then awaits proc.wait(). We mock these stream interfaces.
+    """
+    stdout_bytes = stdout.encode("utf-8")
+    stderr_bytes = stderr.encode("utf-8")
+
+    # Mock stdout stream — supports both read(n) and readline()
+    mock_stdout = AsyncMock()
+    _stdout_read_done = {"done": False}
+
+    async def _stdout_read(n: int = -1) -> bytes:
+        if _stdout_read_done["done"]:
+            return b""
+        _stdout_read_done["done"] = True
+        return stdout_bytes
+
+    _stdout_lines = (stdout_bytes.split(b"\n") if stdout_bytes else [])
+    _stdout_line_iter = iter([line + b"\n" for line in _stdout_lines if line] + [b""])
+
+    async def _stdout_readline() -> bytes:
+        return next(_stdout_line_iter, b"")
+
+    mock_stdout.read = _stdout_read
+    mock_stdout.readline = _stdout_readline
+
+    # Mock stderr stream — readline interface
+    _stderr_lines = (stderr_bytes.split(b"\n") if stderr_bytes else [])
+    _stderr_line_iter = iter([line + b"\n" for line in _stderr_lines if line] + [b""])
+    mock_stderr = AsyncMock()
+
+    async def _stderr_readline() -> bytes:
+        return next(_stderr_line_iter, b"")
+
+    mock_stderr.readline = _stderr_readline
+
+    # Mock stdin (for _feed_stdin)
+    mock_stdin = AsyncMock()
+    mock_stdin.write = AsyncMock()
+    mock_stdin.drain = AsyncMock(return_value=None)
+    mock_stdin.close = AsyncMock()
+
     proc = AsyncMock()
-    proc.communicate = AsyncMock(return_value=(stdout.encode("utf-8"), stderr.encode("utf-8")))
+    proc.stdout = mock_stdout
+    proc.stderr = mock_stderr
+    proc.stdin = mock_stdin
     proc.returncode = returncode
     proc.kill = AsyncMock()
     proc.wait = AsyncMock()
@@ -96,9 +144,13 @@ class TestToolProviderSend:
             assert response.finish_reason == "stop"
 
     @pytest.mark.asyncio
-    async def test_claude_json_success(self) -> None:
-        json_output = json.dumps({"result": "Generated code here"})
-        proc = _mock_process(stdout=json_output)
+    async def test_claude_stream_json_success(self) -> None:
+        # stream-json format: JSONL with a result event at the end
+        stream_output = (
+            json.dumps({"type": "system", "subtype": "init"}) + "\n"
+            + json.dumps({"type": "result", "subtype": "success", "result": "Generated code here"}) + "\n"
+        )
+        proc = _mock_process(stdout=stream_output)
         with patch("asyncio.create_subprocess_exec", return_value=proc):
             provider = ToolProvider(
                 backend=ToolBackend.CLAUDE_CODE,
@@ -137,12 +189,20 @@ class TestToolProviderSend:
     @pytest.mark.asyncio
     async def test_timeout_raises_timeout_error(self) -> None:
         proc = _mock_process()
-        proc.communicate = AsyncMock(side_effect=asyncio.TimeoutError)
+
+        # Make stdout read hang so the real timeout fires
+        async def _hang(*args: object, **kwargs: object) -> bytes:
+            await asyncio.sleep(999999)
+            return b""  # unreachable
+
+        proc.stdout.read = _hang
+        proc.stdout.readline = _hang
+
         with patch("asyncio.create_subprocess_exec", return_value=proc):
             provider = ToolProvider(
                 backend=ToolBackend.CODEX_CLI,
                 binary_path="/usr/bin/codex",
-                timeout_seconds=1.0,
+                timeout_seconds=0.01,
             )
             with pytest.raises(ProviderTimeoutError, match="timed out"):
                 await provider.send(_make_request())
@@ -238,16 +298,53 @@ class TestAssemblePrompt:
         assert "def hello(): pass" in text
 
 
-class TestParseClaudeJsonOutput:
-    """Tests for _parse_claude_json_output()."""
+class TestParseClaudeStreamOutput:
+    """Tests for _parse_claude_stream_output() (stream-json JSONL format)."""
+
+    def test_result_event_string(self) -> None:
+        stdout = json.dumps({"type": "result", "subtype": "success", "result": "hello"})
+        assert _parse_claude_stream_output(stdout) == "hello"
+
+    def test_result_event_with_content_blocks(self) -> None:
+        stdout = json.dumps({
+            "type": "result",
+            "subtype": "success",
+            "result": [
+                {"type": "text", "text": "part1"},
+                {"type": "text", "text": "part2"},
+            ],
+        })
+        assert _parse_claude_stream_output(stdout) == "part1\npart2"
+
+    def test_multiline_jsonl(self) -> None:
+        lines = [
+            json.dumps({"type": "system", "subtype": "init"}),
+            json.dumps({"type": "assistant", "message": {"content": [{"type": "text", "text": "thinking"}]}}),
+            json.dumps({"type": "result", "subtype": "success", "result": "final answer"}),
+        ]
+        stdout = "\n".join(lines)
+        assert _parse_claude_stream_output(stdout) == "final answer"
+
+    def test_empty_string_fallback(self) -> None:
+        assert _parse_claude_stream_output("") == ""
+
+    def test_no_result_event_falls_back(self) -> None:
+        stdout = json.dumps({"type": "system", "subtype": "init"})
+        # Falls back to legacy parser which returns raw stdout
+        result = _parse_claude_stream_output(stdout)
+        assert result == stdout.strip()
+
+
+class TestParseClaudeJsonFallback:
+    """Tests for _parse_claude_json_fallback() (legacy single-JSON format)."""
 
     def test_result_field(self) -> None:
         stdout = json.dumps({"result": "hello"})
-        assert _parse_claude_json_output(stdout) == "hello"
+        assert _parse_claude_json_fallback(stdout) == "hello"
 
     def test_content_field(self) -> None:
         stdout = json.dumps({"content": "hello"})
-        assert _parse_claude_json_output(stdout) == "hello"
+        assert _parse_claude_json_fallback(stdout) == "hello"
 
     def test_result_list_of_text_blocks(self) -> None:
         stdout = json.dumps(
@@ -258,15 +355,226 @@ class TestParseClaudeJsonOutput:
                 ]
             }
         )
-        assert _parse_claude_json_output(stdout) == "part1\npart2"
+        assert _parse_claude_json_fallback(stdout) == "part1\npart2"
 
     def test_invalid_json_returns_raw(self) -> None:
         stdout = "not json at all"
-        assert _parse_claude_json_output(stdout) == "not json at all"
+        assert _parse_claude_json_fallback(stdout) == "not json at all"
 
     def test_empty_string(self) -> None:
-        assert _parse_claude_json_output("") == ""
+        assert _parse_claude_json_fallback("") == ""
 
     def test_fallback_to_raw_stdout(self) -> None:
         stdout = json.dumps({"unknown_key": 42})
-        assert _parse_claude_json_output(stdout) == stdout.strip()
+        assert _parse_claude_json_fallback(stdout) == stdout.strip()
+
+
+class TestWorkspaceIsolation:
+    """Tests for workspace directory isolation in ToolProvider."""
+
+    @pytest.mark.asyncio
+    async def test_workspace_dir_passed_as_cwd(self, tmp_path: Path) -> None:
+        """When workspace_dir is set, it must be passed as cwd to the subprocess."""
+        proc = _mock_process(stdout="output")
+        with patch("asyncio.create_subprocess_exec", return_value=proc) as mock_exec:
+            provider = ToolProvider(
+                backend=ToolBackend.CODEX_CLI,
+                binary_path="/usr/bin/codex",
+            )
+            request = ProviderRequest(
+                model="codex_cli",
+                role_id="implementer",
+                user_prompt="test",
+                workspace_dir=tmp_path,
+            )
+            await provider.send(request)
+            mock_exec.assert_called_once()
+            call_kwargs = mock_exec.call_args
+            assert call_kwargs.kwargs.get("cwd") == str(tmp_path)
+
+    @pytest.mark.asyncio
+    async def test_no_workspace_dir_passes_none_cwd(self) -> None:
+        """Without workspace_dir, cwd should be None (inherit parent cwd)."""
+        proc = _mock_process(stdout="output")
+        with patch("asyncio.create_subprocess_exec", return_value=proc) as mock_exec:
+            provider = ToolProvider(
+                backend=ToolBackend.CODEX_CLI,
+                binary_path="/usr/bin/codex",
+            )
+            await provider.send(_make_request())
+            call_kwargs = mock_exec.call_args
+            assert call_kwargs.kwargs.get("cwd") is None
+
+    @pytest.mark.asyncio
+    async def test_invalid_workspace_dir_raises_error(self, tmp_path: Path) -> None:
+        """A workspace_dir that does not exist must raise ProviderServiceError."""
+        provider = ToolProvider(
+            backend=ToolBackend.CODEX_CLI,
+            binary_path="/usr/bin/codex",
+        )
+        request = ProviderRequest(
+            model="codex_cli",
+            role_id="implementer",
+            user_prompt="test",
+            workspace_dir=tmp_path / "nonexistent",
+        )
+        with pytest.raises(ProviderServiceError, match="not a directory"):
+            await provider.send(request)
+
+    @pytest.mark.asyncio
+    async def test_orchestrator_repo_root_rejected(self, tmp_path: Path) -> None:
+        """workspace_dir that equals orchestrator_repo_root must be rejected."""
+        provider = ToolProvider(
+            backend=ToolBackend.CODEX_CLI,
+            binary_path="/usr/bin/codex",
+        )
+        request = ProviderRequest(
+            model="codex_cli",
+            role_id="implementer",
+            user_prompt="test",
+            workspace_dir=tmp_path,
+            metadata={"orchestrator_repo_root": str(tmp_path)},
+        )
+        with pytest.raises(ProviderServiceError, match="must not be the orchestrator"):
+            await provider.send(request)
+
+    @pytest.mark.asyncio
+    async def test_workspace_dir_different_from_repo_root_allowed(
+        self, tmp_path: Path,
+    ) -> None:
+        """workspace_dir that is NOT the orchestrator root should be allowed."""
+        workspace = tmp_path / "workspaces" / "item1"
+        workspace.mkdir(parents=True)
+        proc = _mock_process(stdout="output")
+        with patch("asyncio.create_subprocess_exec", return_value=proc) as mock_exec:
+            provider = ToolProvider(
+                backend=ToolBackend.CODEX_CLI,
+                binary_path="/usr/bin/codex",
+            )
+            request = ProviderRequest(
+                model="codex_cli",
+                role_id="implementer",
+                user_prompt="test",
+                workspace_dir=workspace,
+                metadata={"orchestrator_repo_root": str(tmp_path)},
+            )
+            await provider.send(request)
+            call_kwargs = mock_exec.call_args
+            assert call_kwargs.kwargs.get("cwd") == str(workspace)
+
+
+class TestModelFlag:
+    """Tests for --model flag in CLI commands."""
+
+    def test_codex_command_with_model_flag(self) -> None:
+        provider = ToolProvider(
+            backend=ToolBackend.CODEX_CLI,
+            binary_path="/usr/bin/codex",
+            model_flag="gpt-5.3",
+        )
+        cmd = provider._build_command("hello")
+        assert "--model" in cmd
+        assert "gpt-5.3" in cmd
+        idx = cmd.index("--model")
+        assert cmd[idx + 1] == "gpt-5.3"
+
+    def test_claude_command_with_model_flag(self) -> None:
+        provider = ToolProvider(
+            backend=ToolBackend.CLAUDE_CODE,
+            binary_path="/usr/bin/claude",
+            model_flag="claude-opus-4-6",
+        )
+        cmd = provider._build_command("hello")
+        assert "--model" in cmd
+        assert "claude-opus-4-6" in cmd
+
+    def test_codex_command_without_model_flag(self) -> None:
+        provider = ToolProvider(
+            backend=ToolBackend.CODEX_CLI,
+            binary_path="/usr/bin/codex",
+        )
+        cmd = provider._build_command("hello")
+        assert "--model" not in cmd
+
+    def test_claude_command_without_model_flag(self) -> None:
+        provider = ToolProvider(
+            backend=ToolBackend.CLAUDE_CODE,
+            binary_path="/usr/bin/claude",
+        )
+        cmd = provider._build_command("hello")
+        assert "--model" not in cmd
+
+    def test_codex_stdin_command_with_model_flag(self) -> None:
+        provider = ToolProvider(
+            backend=ToolBackend.CODEX_CLI,
+            binary_path="/usr/bin/codex",
+            model_flag="gpt-5.3-spark",
+        )
+        cmd = provider._build_command_stdin()
+        assert "--model" in cmd
+        assert "gpt-5.3-spark" in cmd
+        # "-" should be last (stdin marker)
+        assert cmd[-1] == "-"
+
+    def test_tool_model_spec_mapping(self) -> None:
+        """Verify TOOL_MODEL_SPEC has entries for all expected models."""
+        assert "codex_gpt53" in TOOL_MODEL_SPEC
+        assert "codex_spark" in TOOL_MODEL_SPEC
+        assert "claude_opus" in TOOL_MODEL_SPEC
+        assert "codex_cli" in TOOL_MODEL_SPEC
+        assert "claude_code" in TOOL_MODEL_SPEC
+
+        # New models have non-empty flags
+        assert TOOL_MODEL_SPEC["codex_gpt53"][1] == "gpt-5.3"
+        assert TOOL_MODEL_SPEC["codex_spark"][1] == "gpt-5.3-spark"
+        assert TOOL_MODEL_SPEC["claude_opus"][1] == "claude-opus-4-6"
+
+        # Legacy models have empty flags
+        assert TOOL_MODEL_SPEC["codex_cli"][1] == ""
+        assert TOOL_MODEL_SPEC["claude_code"][1] == ""
+
+
+class TestFormatToolCode:
+    """Tests for _format_tool_code() code extraction."""
+
+    def test_write_tool(self) -> None:
+        lines = _format_tool_code("Write", {
+            "file_path": "src/main.py",
+            "content": "def hello():\n    print('hi')\n",
+        })
+        assert len(lines) > 0
+        assert any("Write: src/main.py" in line for line in lines)
+        assert any("| def hello():" in line for line in lines)
+        assert any("--- end ---" in line for line in lines)
+
+    def test_edit_tool_with_old_and_new(self) -> None:
+        lines = _format_tool_code("Edit", {
+            "file_path": "src/foo.py",
+            "old_string": "old_code()",
+            "new_string": "new_code()",
+        })
+        assert any("Edit: src/foo.py" in line for line in lines)
+        assert any("- old_code()" in line for line in lines)
+        assert any(">>>" in line for line in lines)
+        assert any("+ new_code()" in line for line in lines)
+
+    def test_bash_tool(self) -> None:
+        lines = _format_tool_code("Bash", {
+            "command": "pytest tests/ -v",
+        })
+        assert any("Bash" in line for line in lines)
+        assert any("$ pytest tests/ -v" in line for line in lines)
+
+    def test_unknown_tool_returns_empty(self) -> None:
+        lines = _format_tool_code("Grep", {"pattern": "foo"})
+        assert lines == []
+
+    def test_write_multiline_content(self) -> None:
+        content = "\n".join([f"line {i}" for i in range(20)])
+        lines = _format_tool_code("Write", {
+            "file_path": "test.py",
+            "content": content,
+        })
+        # All 20 lines should appear (no truncation)
+        code_lines = [l for l in lines if l.startswith("  | ")]
+        assert len(code_lines) == 20

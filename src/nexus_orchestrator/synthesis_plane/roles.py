@@ -781,6 +781,8 @@ def _assert_known_role_names(names: set[str] | None, known: set[str], field_name
 
 _PROFILE_CODE = "code"
 _PROFILE_ARCHITECT = "architect"
+_PROFILE_TRIAGE = "triage"
+_PROFILE_FAST = "fast"
 
 
 def _resolve_provider_profile_models(
@@ -818,12 +820,28 @@ def _resolve_provider_profile_models(
                 f"unable to resolve provider model profile for {provider_name}: {exc}"
             ) from exc
 
-        provider_models[provider_name] = MappingProxyType(
-            {
-                _PROFILE_CODE: resolved_code,
-                _PROFILE_ARCHITECT: resolved_architect,
-            }
-        )
+        profile_map: dict[str, str] = {
+            _PROFILE_CODE: resolved_code,
+            _PROFILE_ARCHITECT: resolved_architect,
+        }
+
+        # Resolve optional triage/fast profiles (only tool provider defines them)
+        for profile_name in (_PROFILE_TRIAGE, _PROFILE_FAST):
+            config_key = f"model_{profile_name}"
+            configured = provider_cfg.get(config_key)
+            configured_model = configured if isinstance(configured, str) else None
+            try:
+                resolved = model_catalog.resolve_model_for_profile(
+                    provider=provider_name,
+                    capability_profile=profile_name,
+                    configured_model=configured_model,
+                )
+                profile_map[profile_name] = resolved
+            except KeyError:
+                # Not all providers define triage/fast profiles — skip silently
+                pass
+
+        provider_models[provider_name] = MappingProxyType(profile_map)
 
     return MappingProxyType(provider_models)
 
@@ -974,6 +992,162 @@ def _default_tool_ladder(
             ),
         )
     )
+
+
+def _codex_first_tool_ladder(
+    *,
+    profile_models: Mapping[str, Mapping[str, str]],
+) -> EscalationPolicy:
+    """Escalation ladder: codex_cli primary (3 attempts), then claude_code fallback (2)."""
+    return EscalationPolicy(
+        steps=(
+            EscalationStep(
+                provider="tool",
+                model=_profile_model(
+                    profile_models,
+                    provider="tool",
+                    capability_profile=_PROFILE_CODE,
+                ),
+                attempts=3,
+            ),
+            EscalationStep(
+                provider="tool",
+                model=_profile_model(
+                    profile_models,
+                    provider="tool",
+                    capability_profile=_PROFILE_ARCHITECT,
+                ),
+                attempts=2,
+            ),
+        )
+    )
+
+
+def _claude_first_tool_ladder(
+    *,
+    profile_models: Mapping[str, Mapping[str, str]],
+) -> EscalationPolicy:
+    """Escalation ladder: claude_code primary (3 attempts), then codex_cli fallback (2)."""
+    return EscalationPolicy(
+        steps=(
+            EscalationStep(
+                provider="tool",
+                model=_profile_model(
+                    profile_models,
+                    provider="tool",
+                    capability_profile=_PROFILE_ARCHITECT,
+                ),
+                attempts=3,
+            ),
+            EscalationStep(
+                provider="tool",
+                model=_profile_model(
+                    profile_models,
+                    provider="tool",
+                    capability_profile=_PROFILE_CODE,
+                ),
+                attempts=2,
+            ),
+        )
+    )
+
+
+def _gpt53_primary_tool_ladder(
+    *,
+    profile_models: Mapping[str, Mapping[str, str]],
+) -> EscalationPolicy:
+    """GPT 5.3 primary (2), Opus fallback (2), Spark final (1)."""
+    tool_profiles = profile_models.get("tool", {})
+    return EscalationPolicy(
+        steps=(
+            EscalationStep(
+                provider="tool",
+                model=tool_profiles.get(_PROFILE_ARCHITECT, "codex_gpt53"),
+                attempts=2,
+            ),
+            EscalationStep(
+                provider="tool",
+                model=tool_profiles.get(_PROFILE_CODE, "claude_opus"),
+                attempts=2,
+            ),
+            EscalationStep(
+                provider="tool",
+                model=tool_profiles.get(_PROFILE_FAST, "codex_spark"),
+                attempts=1,
+            ),
+        )
+    )
+
+
+def _spark_primary_tool_ladder(
+    *,
+    profile_models: Mapping[str, Mapping[str, str]],
+) -> EscalationPolicy:
+    """Spark primary (2), Opus fallback (2), GPT53 final (1)."""
+    tool_profiles = profile_models.get("tool", {})
+    return EscalationPolicy(
+        steps=(
+            EscalationStep(
+                provider="tool",
+                model=tool_profiles.get(_PROFILE_FAST, "codex_spark"),
+                attempts=2,
+            ),
+            EscalationStep(
+                provider="tool",
+                model=tool_profiles.get(_PROFILE_CODE, "claude_opus"),
+                attempts=2,
+            ),
+            EscalationStep(
+                provider="tool",
+                model=tool_profiles.get(_PROFILE_ARCHITECT, "codex_gpt53"),
+                attempts=1,
+            ),
+        )
+    )
+
+
+def _opus_primary_tool_ladder(
+    *,
+    profile_models: Mapping[str, Mapping[str, str]],
+) -> EscalationPolicy:
+    """Opus primary (2), GPT53 fallback (2), Spark final (1)."""
+    tool_profiles = profile_models.get("tool", {})
+    return EscalationPolicy(
+        steps=(
+            EscalationStep(
+                provider="tool",
+                model=tool_profiles.get(_PROFILE_CODE, "claude_opus"),
+                attempts=2,
+            ),
+            EscalationStep(
+                provider="tool",
+                model=tool_profiles.get(_PROFILE_ARCHITECT, "codex_gpt53"),
+                attempts=2,
+            ),
+            EscalationStep(
+                provider="tool",
+                model=tool_profiles.get(_PROFILE_FAST, "codex_spark"),
+                attempts=1,
+            ),
+        )
+    )
+
+
+def resolve_tool_ladder_for_affinity(
+    affinity: object,
+    profile_models: Mapping[str, Mapping[str, str]],
+) -> EscalationPolicy:
+    """Resolve the appropriate tool escalation ladder for a given ModelAffinity."""
+    from nexus_orchestrator.synthesis_plane.work_item_classifier import ModelAffinity
+
+    if affinity == ModelAffinity.GPT53:
+        return _gpt53_primary_tool_ladder(profile_models=profile_models)
+    if affinity == ModelAffinity.SPARK:
+        return _spark_primary_tool_ladder(profile_models=profile_models)
+    if affinity == ModelAffinity.OPUS:
+        return _opus_primary_tool_ladder(profile_models=profile_models)
+    # Legacy fallback
+    return _opus_primary_tool_ladder(profile_models=profile_models)
 
 
 def _default_roles(
@@ -1150,4 +1324,5 @@ __all__ = [
     "ROLE_TOOLSMITH",
     "RoleBudget",
     "RoleRegistry",
+    "resolve_tool_ladder_for_affinity",
 ]

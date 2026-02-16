@@ -64,6 +64,11 @@ from nexus_orchestrator.synthesis_plane.roles import (
     ROLE_IMPLEMENTER,
     EscalationDecision,
     RoleRegistry,
+    resolve_tool_ladder_for_affinity,
+)
+from nexus_orchestrator.synthesis_plane.work_item_classifier import (
+    ModelAffinity,
+    classify_work_item,
 )
 from nexus_orchestrator.utils.hashing import sha256_text
 from nexus_orchestrator.verification_plane import (
@@ -220,6 +225,10 @@ class OrchestratorController:
     def state_db_path(self) -> Path:
         return self._state_db.path
 
+    def _log(self, message: str) -> None:
+        """Print progress message to stdout for TUI display."""
+        print(f"[nexus] {message}", flush=True)
+
     def pause(self, run_id: str) -> Run | None:
         with self._lock:
             self._pause_requests.add(run_id)
@@ -285,6 +294,7 @@ class OrchestratorController:
         )
 
         resolved_spec = self._resolve_spec_path(spec_path)
+        self._log(f"Spec: {resolved_spec.relative_path}")
         normalized_mode = mode.strip().lower()
         run_record, resumed = self._load_or_create_run(
             spec_relative=resolved_spec.relative_path,
@@ -296,8 +306,10 @@ class OrchestratorController:
         warning_messages.extend(
             self._warn_on_run_metadata(run_record.id, warning_messages=tuple(warning_messages))
         )
+        self._log(f"Run {run_record.id[:12]}{'  (resumed)' if resumed else ''}")
 
         if not resumed or not self._work_item_repo.list_for_run(run_record.id, limit=1):
+            self._log("Planning...")
             compilation = self._plan_run(
                 run_record=run_record,
                 spec_absolute=resolved_spec.absolute_path,
@@ -305,6 +317,7 @@ class OrchestratorController:
             )
             warning_messages.extend(compilation.warnings)
             if compilation.task_graph is None or compilation.errors:
+                self._log(f"Planning FAILED: {len(compilation.errors)} errors")
                 self._record_incident(
                     run_id=run_record.id,
                     category="planning",
@@ -320,6 +333,7 @@ class OrchestratorController:
                     resumed=resumed,
                     warnings=tuple(sorted(set(warning_messages))),
                 )
+            self._log(f"Planning complete: {len(compilation.work_items)} work items")
 
         self._recover_inflight_work_items(run_record.id, merge_queue)
         latest_run = self._require_run(run_record.id)
@@ -327,6 +341,15 @@ class OrchestratorController:
             latest_run.status is RunStatus.PAUSED and normalized_mode in {"resume", "auto"}
         ):
             latest_run = self._run_repo.set_status(run_record.id, RunStatus.RUNNING)
+
+        initial_items = self._work_item_repo.list_for_run(run_record.id, limit=1_000)
+        total_items = len(initial_items)
+        already_done = sum(
+            1 for item in initial_items
+            if item.status in {WorkItemStatus.MERGED, WorkItemStatus.FAILED}
+        )
+        items_processed = already_done
+        self._log(f"{total_items} work items ({already_done} already completed)")
 
         try:
             while True:
@@ -375,6 +398,7 @@ class OrchestratorController:
                     )
 
                 if all(item.status is WorkItemStatus.MERGED for item in work_items):
+                    self._log("All work items merged — run complete")
                     self._run_repo.set_status(current_run.id, RunStatus.COMPLETED)
                     return self._build_result(
                         run_id=current_run.id,
@@ -401,6 +425,7 @@ class OrchestratorController:
                         if item.status not in {WorkItemStatus.MERGED, WorkItemStatus.FAILED}
                     ]
                     if unresolved:
+                        self._log("Run deadlocked — no runnable work items remain")
                         self._run_repo.set_status(current_run.id, RunStatus.FAILED)
                         self._record_incident(
                             run_id=current_run.id,
@@ -408,8 +433,13 @@ class OrchestratorController:
                             message="run is deadlocked; no runnable work items remain",
                         )
                     elif any(item.status is WorkItemStatus.FAILED for item in work_items):
+                        failed_count = sum(
+                            1 for item in work_items if item.status is WorkItemStatus.FAILED
+                        )
+                        self._log(f"Run finished with {failed_count} failed work items")
                         self._run_repo.set_status(current_run.id, RunStatus.FAILED)
                     else:
+                        self._log("Run complete")
                         self._run_repo.set_status(current_run.id, RunStatus.COMPLETED)
                     return self._build_result(
                         run_id=current_run.id,
@@ -420,6 +450,8 @@ class OrchestratorController:
                 batch_ids = tuple(item.id for item in runnable)
                 self._append_dispatch_batch(current_run.id, batch_ids)
                 for work_item in runnable:
+                    items_processed += 1
+                    self._log(f"[{items_processed}/{total_items}] {work_item.title}")
                     self._process_work_item(
                         run_id=current_run.id,
                         work_item=work_item,
@@ -451,7 +483,22 @@ class OrchestratorController:
                 )
         except SimulatedCrashError:
             raise
+        except KeyboardInterrupt:
+            self._log("Run interrupted by user (Ctrl+C)")
+            self._record_incident(
+                run_id=run_record.id,
+                category="controller",
+                message="run interrupted by user",
+            )
+            self._run_repo.set_status(run_record.id, RunStatus.CANCELLED)
+            warning_messages.append("run interrupted by user")
+            return self._build_result(
+                run_id=run_record.id,
+                resumed=resumed,
+                warnings=tuple(sorted(set(warning_messages))),
+            )
         except Exception as exc:  # noqa: BLE001
+            self._log(f"Run crashed: {exc}")
             self._record_incident(
                 run_id=run_record.id,
                 category="controller",
@@ -582,23 +629,75 @@ class OrchestratorController:
         dispatch_plan = self._build_dispatch_plan(
             run_id=run_id,
             work_item=work_item,
+            effective_config=effective_config,
             role_registry=role_registry,
             model_catalog=model_catalog,
             warned_models=warned_models,
             warning_messages=warning_messages,
         )
         if dispatch_plan is None:
+            self._log("  No routing decision available — skipping")
             self._work_item_repo.set_status(work_item.id, WorkItemStatus.FAILED, run_id=run_id)
             return
 
+        # ── Workspace isolation ──────────────────────────────────────
+        # For real (non-mock) dispatch, create the isolated git worktree
+        # BEFORE dispatching the agent so the subprocess runs inside it.
+        # This prevents agents from ever seeing or modifying the
+        # orchestrator repository.
+        pre_attempt_id = ids.generate_attempt_id()
+        workspace: Workspace | None = None
+        workspace_cwd: Path | None = None
+
+        if not mock:
+            try:
+                workspace = workspace_manager.create_workspace(
+                    work_item.id,
+                    pre_attempt_id,
+                    work_item.scope,
+                    base_branch=git_engine.integration_branch,
+                )
+                workspace_cwd = workspace.paths.workspace_dir
+            except Exception as exc:  # noqa: BLE001
+                self._record_incident(
+                    run_id=run_id,
+                    category="workspace",
+                    message=f"failed to create workspace: {exc}",
+                    related_work_item_id=work_item.id,
+                )
+                self._work_item_repo.set_status(
+                    work_item.id, WorkItemStatus.FAILED, run_id=run_id,
+                )
+                return
+            self._workspace_by_branch[workspace.branch_name] = workspace
+
+            # Rebuild the prompt with workspace context so the agent
+            # knows it is running inside an isolated worktree.
+            augmented_prompt = self._build_prompt(
+                work_item,
+                dispatch_plan.decision,
+                dispatch_plan.attempt_number,
+                workspace_dir=workspace_cwd,
+            )
+            dispatch_plan = _DispatchPlan(
+                work_item=dispatch_plan.work_item,
+                decision=dispatch_plan.decision,
+                attempt_number=dispatch_plan.attempt_number,
+                prompt=augmented_prompt,
+                dispatch_budget=dispatch_plan.dispatch_budget,
+            )
+
+        self._log(f"  Dispatching via {dispatch_plan.decision.model}...")
         dispatch_outcome = self._dispatch_one(
             run_id=run_id,
             dispatch_plan=dispatch_plan,
             effective_config=effective_config,
             mock=mock,
             model_catalog=model_catalog,
+            workspace_cwd=workspace_cwd,
         )
         if dispatch_outcome.error is not None or dispatch_outcome.result is None:
+            self._log(f"  Dispatch FAILED: {dispatch_outcome.error or 'unknown'}")
             self._record_incident(
                 run_id=run_id,
                 category="dispatch",
@@ -606,8 +705,14 @@ class OrchestratorController:
                 related_work_item_id=work_item.id,
             )
             self._work_item_repo.set_status(work_item.id, WorkItemStatus.FAILED, run_id=run_id)
+            if workspace is not None:
+                self._cleanup_workspace_for_branch(workspace.branch_name, workspace_manager)
             return
 
+        self._log(
+            f"  Dispatch OK ({dispatch_outcome.dispatch_result_tokens} tokens, "
+            f"${dispatch_outcome.dispatch_result_cost_usd:.4f})"
+        )
         self._update_budget_usage(
             run_id=run_id,
             tokens=dispatch_outcome.dispatch_result_tokens,
@@ -616,7 +721,12 @@ class OrchestratorController:
         )
         self._attempts_processed += 1
 
-        attempt_id = dispatch_outcome.dispatch_result_attempt_id
+        # Use our pre-generated attempt_id for workspace naming (real mode)
+        # or the dispatch-generated one for mock mode.
+        attempt_id = pre_attempt_id
+        if mock:
+            attempt_id = dispatch_outcome.dispatch_result_attempt_id or pre_attempt_id
+
         if attempt_id is None:
             self._record_incident(
                 run_id=run_id,
@@ -625,38 +735,51 @@ class OrchestratorController:
                 related_work_item_id=work_item.id,
             )
             self._work_item_repo.set_status(work_item.id, WorkItemStatus.FAILED, run_id=run_id)
+            if workspace is not None:
+                self._cleanup_workspace_for_branch(workspace.branch_name, workspace_manager)
             return
 
-        workspace: Workspace
-        try:
-            workspace = workspace_manager.create_workspace(
-                work_item.id,
-                attempt_id,
-                work_item.scope,
-                base_branch=git_engine.integration_branch,
-            )
-        except Exception as exc:  # noqa: BLE001
-            self._record_incident(
-                run_id=run_id,
-                category="workspace",
-                message=f"failed to create workspace: {exc}",
-                related_work_item_id=work_item.id,
-            )
-            self._work_item_repo.set_status(work_item.id, WorkItemStatus.FAILED, run_id=run_id)
-            return
-        self._workspace_by_branch[workspace.branch_name] = workspace
+        # ── Mock mode: create workspace AFTER dispatch (existing flow) ──
+        if mock and workspace is None:
+            try:
+                workspace = workspace_manager.create_workspace(
+                    work_item.id,
+                    attempt_id,
+                    work_item.scope,
+                    base_branch=git_engine.integration_branch,
+                )
+            except Exception as exc:  # noqa: BLE001
+                self._record_incident(
+                    run_id=run_id,
+                    category="workspace",
+                    message=f"failed to create workspace: {exc}",
+                    related_work_item_id=work_item.id,
+                )
+                self._work_item_repo.set_status(
+                    work_item.id, WorkItemStatus.FAILED, run_id=run_id,
+                )
+                return
+            self._workspace_by_branch[workspace.branch_name] = workspace
+
+        assert workspace is not None  # noqa: S101
 
         try:
             if mock:
+                # Mock mode: apply the returned patch to the workspace
                 self._seed_missing_mock_scope_files(
                     workspace_dir=workspace.paths.workspace_dir,
                     scope=work_item.scope,
                 )
-            git_engine.apply_patch(workspace.paths.workspace_dir, dispatch_outcome.result.raw_text)
+                git_engine.apply_patch(
+                    workspace.paths.workspace_dir, dispatch_outcome.result.raw_text,
+                )
+            # else: real mode — agent already modified files directly in the
+            # workspace worktree; nothing to apply.
+
             try:
                 git_engine.commit(
                     workspace.paths.workspace_dir,
-                    f"{work_item.title} (mock)",
+                    f"{work_item.title} ({'mock' if mock else 'nexus'})",
                     work_item=work_item.id,
                     evidence="pending",
                     agent=ROLE_IMPLEMENTER,
@@ -666,6 +789,7 @@ class OrchestratorController:
                 if "No staged changes to commit after filtering internal files." not in str(exc):
                     raise
         except Exception as exc:  # noqa: BLE001
+            self._log(f"  Patch apply FAILED: {exc}")
             self._record_incident(
                 run_id=run_id,
                 category="patch_apply",
@@ -677,6 +801,7 @@ class OrchestratorController:
             return
 
         self._work_item_repo.set_status(work_item.id, WorkItemStatus.VERIFYING, run_id=run_id)
+        self._log("  Verifying...")
         gate_decision, evidence_ids = self._verify_and_record(
             run_id=run_id,
             work_item=work_item,
@@ -686,6 +811,7 @@ class OrchestratorController:
             attempt_id=attempt_id,
         )
         if not gate_decision.accepted:
+            self._log(f"  Verification FAILED: {', '.join(gate_decision.reason_codes)}")
             self._record_incident(
                 run_id=run_id,
                 category="constraint_gate",
@@ -700,6 +826,7 @@ class OrchestratorController:
             self._cleanup_workspace_for_branch(workspace.branch_name, workspace_manager)
             return
 
+        self._log("  Verification passed")
         self._work_item_repo.set_status(work_item.id, WorkItemStatus.PASSED, run_id=run_id)
         candidate = QueueCandidate(
             branch=workspace.branch_name,
@@ -710,7 +837,9 @@ class OrchestratorController:
         )
         try:
             merge_queue.enqueue(candidate)
+            self._log("  Queued for merge")
         except Exception as exc:  # noqa: BLE001
+            self._log(f"  Merge queue FAILED: {exc}")
             self._record_incident(
                 run_id=run_id,
                 category="merge_queue",
@@ -728,26 +857,99 @@ class OrchestratorController:
         effective_config: Mapping[str, object],
         mock: bool,
         model_catalog: ModelCatalog,
+        workspace_cwd: Path | None = None,
     ) -> _DispatchOutcome:
-        patch_by_work_item = {
-            dispatch_plan.work_item.id: self._mock_patch_for_work_item(dispatch_plan.work_item),
-        }
         if mock:
+            patch_by_work_item = {
+                dispatch_plan.work_item.id: self._mock_patch_for_work_item(dispatch_plan.work_item),
+            }
             provider = _DeterministicMockProvider(
                 provider_name=dispatch_plan.decision.provider,
                 model_catalog=model_catalog,
                 patch_by_work_item=patch_by_work_item,
             )
         else:
-            return _DispatchOutcome(
-                plan=dispatch_plan,
-                result=None,
-                dispatch_result_attempt_id=None,
-                dispatch_result_attempts=0,
-                dispatch_result_tokens=0,
-                dispatch_result_cost_usd=0.0,
-                error="non-mock providers are not configured in this controller implementation",
+            # Real mode: use detected CLI tool backends (codex / claude)
+            from nexus_orchestrator.synthesis_plane.providers.tool_adapter import (
+                TOOL_MODEL_SPEC,
+                ToolBackend,
+                ToolProvider,
             )
+            from nexus_orchestrator.synthesis_plane.providers.tool_detection import detect_all_backends
+
+            backends = detect_all_backends()
+            if not backends:
+                return _DispatchOutcome(
+                    plan=dispatch_plan,
+                    result=None,
+                    dispatch_result_attempt_id=None,
+                    dispatch_result_attempts=0,
+                    dispatch_result_tokens=0,
+                    dispatch_result_cost_usd=0.0,
+                    error="no CLI tool backends available (install codex or claude CLI)",
+                )
+
+            _name_to_enum = {"codex": ToolBackend.CODEX_CLI, "claude": ToolBackend.CLAUDE_CODE}
+
+            # Pick backend matching the escalation model when possible
+            model_name = dispatch_plan.decision.model
+            _model_to_backend = {
+                "codex_cli": "codex",
+                "claude_code": "claude",
+                "codex_gpt53": "codex",
+                "codex_spark": "codex",
+                "claude_opus": "claude",
+            }
+            preferred_name = _model_to_backend.get(model_name)
+            backend_info = backends[0]  # default: first detected
+            if preferred_name is not None:
+                for bi in backends:
+                    if bi.name == preferred_name:
+                        backend_info = bi
+                        break
+
+            backend_enum = _name_to_enum.get(backend_info.name)
+            if backend_enum is None:
+                return _DispatchOutcome(
+                    plan=dispatch_plan,
+                    result=None,
+                    dispatch_result_attempt_id=None,
+                    dispatch_result_attempts=0,
+                    dispatch_result_tokens=0,
+                    dispatch_result_cost_usd=0.0,
+                    error=f"unknown tool backend: {backend_info.name}",
+                )
+
+            # Resolve --model flag for the CLI tool
+            model_spec = TOOL_MODEL_SPEC.get(model_name)
+            model_flag = model_spec[1] if model_spec else ""
+
+            # Read timeout from config (default 600s)
+            tool_cfg = _nested_mapping_get(effective_config, ("providers", "tool"))
+            timeout_seconds = 600.0
+            if tool_cfg is not None:
+                timeout_raw = tool_cfg.get("timeout_seconds")
+                if isinstance(timeout_raw, (int, float)) and not isinstance(timeout_raw, bool):
+                    timeout_seconds = max(float(timeout_raw), 30.0)
+
+            try:
+                provider = ToolProvider(
+                    backend=backend_enum,
+                    binary_path=backend_info.binary_path,
+                    timeout_seconds=timeout_seconds,
+                    model_catalog=model_catalog,
+                    model_flag=model_flag,
+                )
+            except Exception as exc:  # noqa: BLE001
+                return _DispatchOutcome(
+                    plan=dispatch_plan,
+                    result=None,
+                    dispatch_result_attempt_id=None,
+                    dispatch_result_attempts=0,
+                    dispatch_result_tokens=0,
+                    dispatch_result_cost_usd=0.0,
+                    error=f"failed to initialize tool provider: {exc}",
+                )
 
         provider_cfg = _nested_mapping_get(
             effective_config,
@@ -788,15 +990,27 @@ class OrchestratorController:
             prompt=dispatch_plan.prompt,
             provider_allowlist=(dispatch_plan.decision.provider,),
             budget=dispatch_plan.dispatch_budget,
+            workspace_dir=workspace_cwd,
             metadata={
                 "attempt_number": dispatch_plan.attempt_number,
                 "provider_name": dispatch_plan.decision.provider,
                 "model_name": dispatch_plan.decision.model,
                 "work_item_id": dispatch_plan.work_item.id,
+                "orchestrator_repo_root": str(self._repo_root),
             },
         )
         try:
             dispatch_result = asyncio.run(controller.dispatch(request))
+        except KeyboardInterrupt:
+            return _DispatchOutcome(
+                plan=dispatch_plan,
+                result=None,
+                dispatch_result_attempt_id=None,
+                dispatch_result_attempts=0,
+                dispatch_result_tokens=0,
+                dispatch_result_cost_usd=0.0,
+                error="dispatch interrupted by user (Ctrl+C)",
+            )
         except Exception as exc:  # noqa: BLE001
             return _DispatchOutcome(
                 plan=dispatch_plan,
@@ -828,11 +1042,52 @@ class OrchestratorController:
             dispatch_result_cost_usd=dispatch_result.cost_usd,
         )
 
+    def _triage_work_item(
+        self,
+        work_item: WorkItem,
+        effective_config: Mapping[str, object],
+    ) -> ModelAffinity:
+        """Route a work item via Spark LLM triage, falling back to deterministic."""
+        from nexus_orchestrator.synthesis_plane.spark_triage import triage_with_spark
+
+        # Check if triage is enabled (default: True)
+        tool_cfg = _nested_mapping_get(effective_config, ("providers", "tool"))
+        triage_enabled = True
+        triage_timeout = 30.0
+        if tool_cfg is not None:
+            te = tool_cfg.get("triage_enabled")
+            if isinstance(te, bool):
+                triage_enabled = te
+            tt = tool_cfg.get("triage_timeout_seconds")
+            if isinstance(tt, (int, float)) and not isinstance(tt, bool):
+                triage_timeout = max(float(tt), 5.0)
+
+        if not triage_enabled:
+            affinity = classify_work_item(work_item)
+            self._log(f"  Triage disabled → deterministic: {affinity.value}")
+            return affinity
+
+        try:
+            triage_result = asyncio.run(triage_with_spark(
+                work_item, timeout_seconds=triage_timeout,
+            ))
+        except Exception:  # noqa: BLE001
+            affinity = classify_work_item(work_item)
+            self._log(f"  Triage error → deterministic: {affinity.value}")
+            return affinity
+
+        if triage_result.used_llm:
+            self._log(f"  Spark triage → {triage_result.chosen_model.value}")
+        else:
+            self._log(f"  {triage_result.reasoning} → {triage_result.chosen_model.value}")
+        return triage_result.chosen_model
+
     def _build_dispatch_plan(
         self,
         *,
         run_id: str,
         work_item: WorkItem,
+        effective_config: Mapping[str, object],
         role_registry: RoleRegistry,
         model_catalog: ModelCatalog,
         warned_models: set[tuple[str, str]],
@@ -840,10 +1095,38 @@ class OrchestratorController:
     ) -> _DispatchPlan | None:
         previous_attempts = self._attempt_repo.list_for_work_item(work_item.id, limit=1_000)
         attempt_number = len(previous_attempts) + 1
-        decision = role_registry.route_attempt(
-            role_name=ROLE_IMPLEMENTER,
-            attempt_number=attempt_number,
-        )
+
+        # Intelligent model delegation: classify work item and pick the
+        # appropriate escalation ladder (codex-first vs claude-first)
+        decision: EscalationDecision | None = None
+        default_provider = "tool"
+        if isinstance(effective_config, Mapping):
+            providers_raw = effective_config.get("providers")
+            if isinstance(providers_raw, Mapping):
+                dp = providers_raw.get("default")
+                if isinstance(dp, str) and dp:
+                    default_provider = dp
+
+        if default_provider == "tool":
+            from nexus_orchestrator.synthesis_plane.roles import (
+                _resolve_provider_profile_models,
+            )
+
+            profile_models = _resolve_provider_profile_models(
+                config=effective_config, model_catalog=model_catalog,
+            )
+            if "tool" in profile_models:
+                # Try Spark LLM triage first, fall back to deterministic classifier
+                affinity = self._triage_work_item(work_item, effective_config)
+                ladder = resolve_tool_ladder_for_affinity(affinity, profile_models)
+                decision = ladder.resolve_attempt(attempt_number)
+
+        # Fall back to role registry if classifier didn't produce a decision
+        if decision is None:
+            decision = role_registry.route_attempt(
+                role_name=ROLE_IMPLEMENTER,
+                attempt_number=attempt_number,
+            )
         if decision is None:
             self._record_incident(
                 run_id=run_id,
@@ -1051,6 +1334,7 @@ class OrchestratorController:
 
             candidate = merge_result.candidate
             if merge_result.status is MergeStatus.MERGED:
+                self._log(f"  Merged: {candidate.work_item_id[:12]}")
                 commit_sha = merge_result.integration_head_after
                 if commit_sha is None:
                     commit_sha = git_engine.get_integration_head()
@@ -1067,6 +1351,7 @@ class OrchestratorController:
                 continue
 
             if merge_result.status in {MergeStatus.FAILED, MergeStatus.REQUEUED}:
+                self._log(f"  Merge {merge_result.status.value}: {candidate.work_item_id[:12]}")
                 if merge_result.status is MergeStatus.FAILED:
                     self._work_item_repo.set_status(
                         candidate.work_item_id,
@@ -1353,25 +1638,35 @@ class OrchestratorController:
         work_item: WorkItem,
         decision: EscalationDecision,
         attempt_number: int,
+        workspace_dir: Path | None = None,
     ) -> str:
         scope = ", ".join(work_item.scope)
         dependencies = ", ".join(work_item.dependencies) if work_item.dependencies else "(none)"
         constraint_ids = ", ".join(
             constraint.id for constraint in work_item.constraint_envelope.constraints
         )
-        return (
-            f"Role: {ROLE_IMPLEMENTER}\n"
-            f"Provider: {decision.provider}\n"
-            f"Model: {decision.model}\n"
-            f"Attempt: {attempt_number}\n"
-            f"WorkItemId: {work_item.id}\n"
-            f"Title: {work_item.title}\n"
-            f"Description: {work_item.description}\n"
-            f"Scope: {scope}\n"
-            f"Dependencies: {dependencies}\n"
-            f"Constraints: {constraint_ids}\n"
-            "Return only a unified git patch."
-        )
+        lines = [
+            f"Role: {ROLE_IMPLEMENTER}",
+            f"Provider: {decision.provider}",
+            f"Model: {decision.model}",
+            f"Attempt: {attempt_number}",
+            f"WorkItemId: {work_item.id}",
+            f"Title: {work_item.title}",
+            f"Description: {work_item.description}",
+            f"Scope: {scope}",
+            f"Dependencies: {dependencies}",
+            f"Constraints: {constraint_ids}",
+        ]
+        if workspace_dir is not None:
+            lines.append(
+                "You are working in an isolated git worktree. "
+                "All file modifications MUST stay within the current working "
+                "directory. Do NOT access, read, or modify files outside of it. "
+                "Implement the requested changes by editing files directly."
+            )
+        else:
+            lines.append("Return only a unified git patch.")
+        return "\n".join(lines)
 
     def _mock_patch_for_work_item(self, work_item: WorkItem) -> str:
         module_suffix = self._module_suffix(work_item)

@@ -18,8 +18,8 @@
 // - Must not include secrets or environment-specific values.
 // - Preserve backward-compatible aliases required by tests and configs.
 {
-  "version": "2026.02.14",
-  "last_updated": "2026-02-14",
+  "version": "2026.02.15",
+  "last_updated": "2026-02-15",
   "default_profiles": {
     "openai": {
       "code": "gpt-5-codex",
@@ -37,9 +37,11 @@
       "review": "local-llama-3.1-70b"
     },
     "tool": {
-      "code": "codex_cli",
-      "architect": "claude_code",
-      "review": "claude_code"
+      "code": "claude_opus",
+      "architect": "codex_gpt53",
+      "review": "claude_opus",
+      "triage": "codex_spark",
+      "fast": "codex_spark"
     }
   },
   "models": [
@@ -173,6 +175,54 @@
     },
     {
       "provider": "tool",
+      "model": "codex_gpt53",
+      "aliases": ["codex-gpt-5.3"],
+      "max_context_tokens": 200000,
+      "supports_tool_calling": false,
+      "supports_structured_outputs": false,
+      "reasoning_effort_allowed": [],
+      "cost": {
+        "input_per_1k_usd": 0.0,
+        "output_per_1k_usd": 0.0,
+        "blended_per_1k_usd": 0.0
+      },
+      "availability": "ga",
+      "notes": "GPT 5.3 via Codex CLI — complex reasoning and architecture tasks."
+    },
+    {
+      "provider": "tool",
+      "model": "codex_spark",
+      "aliases": ["codex-spark", "gpt-5.3-spark-codex"],
+      "max_context_tokens": 200000,
+      "supports_tool_calling": false,
+      "supports_structured_outputs": false,
+      "reasoning_effort_allowed": [],
+      "cost": {
+        "input_per_1k_usd": 0.0,
+        "output_per_1k_usd": 0.0,
+        "blended_per_1k_usd": 0.0
+      },
+      "availability": "ga",
+      "notes": "GPT 5.3 Spark via Codex CLI — fast tasks and triage routing."
+    },
+    {
+      "provider": "tool",
+      "model": "claude_opus",
+      "aliases": ["claude-opus-4-6-tool"],
+      "max_context_tokens": 200000,
+      "supports_tool_calling": false,
+      "supports_structured_outputs": false,
+      "reasoning_effort_allowed": [],
+      "cost": {
+        "input_per_1k_usd": 0.0,
+        "output_per_1k_usd": 0.0,
+        "blended_per_1k_usd": 0.0
+      },
+      "availability": "ga",
+      "notes": "Claude Opus 4.6 via Claude Code CLI — deep coding with large context."
+    },
+    {
+      "provider": "tool",
       "model": "codex_cli",
       "aliases": ["codex-cli"],
       "max_context_tokens": 128000,
@@ -184,8 +234,8 @@
         "output_per_1k_usd": 0.0,
         "blended_per_1k_usd": 0.0
       },
-      "availability": "experimental",
-      "notes": "OpenAI Codex CLI backend (subscription-based, no API key)."
+      "availability": "legacy",
+      "notes": "Legacy Codex CLI entry — use codex_gpt53 or codex_spark instead."
     },
     {
       "provider": "tool",
@@ -200,8 +250,8 @@
         "output_per_1k_usd": 0.0,
         "blended_per_1k_usd": 0.0
       },
-      "availability": "experimental",
-      "notes": "Claude Code CLI backend (subscription-based, no API key)."
+      "availability": "legacy",
+      "notes": "Legacy Claude Code CLI entry — use claude_opus instead."
     }
   ]
 }

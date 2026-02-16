@@ -29,7 +29,7 @@ pytestmark = [
 
 
 class TestTranscriptWidget:
-    """Test selectable transcript backed by read-only TextArea."""
+    """Test transcript backed by RichLog with blue-themed styling."""
 
     @pytest.mark.asyncio
     async def test_append_event_updates_text(self) -> None:
@@ -49,7 +49,7 @@ class TestTranscriptWidget:
             tw.append_event(event)
             await pilot.pause()
 
-            assert "hello world" in tw.text_area.text
+            assert "hello world" in tw.text
 
     @pytest.mark.asyncio
     async def test_append_multiple_events(self) -> None:
@@ -72,7 +72,7 @@ class TestTranscriptWidget:
             tw.append_events(events)
             await pilot.pause()
 
-            text = tw.text_area.text
+            text = tw.text
             for i in range(5):
                 assert f"line {i}" in text
 
@@ -92,67 +92,67 @@ class TestTranscriptWidget:
             tw = app.query_one("#transcript", TranscriptWidget)
             tw.append_event(TranscriptEvent(kind=EventKind.STDOUT, text="test"))
             await pilot.pause()
-            assert tw.text_area.text.strip() != ""
+            assert tw._event_count > 0
 
             tw.clear()
             await pilot.pause()
-            assert tw.text_area.text == ""
+            assert tw._event_count == 0
 
     @pytest.mark.asyncio
     async def test_event_formatting_stdout(self) -> None:
         """STDOUT events format as plain text."""
         from nexus_orchestrator.ui.tui.state import EventKind, TranscriptEvent
-        from nexus_orchestrator.ui.tui.widgets.transcript import _format_event
+        from nexus_orchestrator.ui.tui.widgets.transcript import _format_event_rich
 
         event = TranscriptEvent(kind=EventKind.STDOUT, text="hello")
-        text = _format_event(event)
-        assert text == "hello"
+        text = _format_event_rich(event, no_color=True)
+        assert text.plain == "hello"
 
     @pytest.mark.asyncio
     async def test_event_formatting_stderr(self) -> None:
         """STDERR events are prefixed with ERR:."""
         from nexus_orchestrator.ui.tui.state import EventKind, TranscriptEvent
-        from nexus_orchestrator.ui.tui.widgets.transcript import _format_event
+        from nexus_orchestrator.ui.tui.widgets.transcript import _format_event_rich
 
         event = TranscriptEvent(kind=EventKind.STDERR, text="warning")
-        text = _format_event(event)
-        assert text == "ERR: warning"
+        text = _format_event_rich(event, no_color=True)
+        assert text.plain == "ERR: warning"
 
     @pytest.mark.asyncio
     async def test_event_formatting_exit_badge_ok(self) -> None:
         """Exit badge with code 0 shows OK."""
         from nexus_orchestrator.ui.tui.state import EventKind, TranscriptEvent
-        from nexus_orchestrator.ui.tui.widgets.transcript import _format_event
+        from nexus_orchestrator.ui.tui.widgets.transcript import _format_event_rich
 
         event = TranscriptEvent(kind=EventKind.EXIT_BADGE, text="", exit_code=0)
-        text = _format_event(event)
-        assert "OK" in text
+        text = _format_event_rich(event, no_color=True)
+        assert "OK" in text.plain
 
     @pytest.mark.asyncio
     async def test_event_formatting_exit_badge_fail(self) -> None:
         """Exit badge with non-zero code shows FAIL."""
         from nexus_orchestrator.ui.tui.state import EventKind, TranscriptEvent
-        from nexus_orchestrator.ui.tui.widgets.transcript import _format_event
+        from nexus_orchestrator.ui.tui.widgets.transcript import _format_event_rich
 
         event = TranscriptEvent(kind=EventKind.EXIT_BADGE, text="", exit_code=1)
-        text = _format_event(event)
-        assert "FAIL" in text
+        text = _format_event_rich(event, no_color=True)
+        assert "FAIL" in text.plain
 
     @pytest.mark.asyncio
     async def test_event_formatting_system(self) -> None:
         """SYSTEM events are prefixed with [system]."""
         from nexus_orchestrator.ui.tui.state import EventKind, TranscriptEvent
-        from nexus_orchestrator.ui.tui.widgets.transcript import _format_event
+        from nexus_orchestrator.ui.tui.widgets.transcript import _format_event_rich
 
         event = TranscriptEvent(kind=EventKind.SYSTEM, text="info msg")
-        text = _format_event(event)
-        assert text == "[system] info msg"
+        text = _format_event_rich(event, no_color=True)
+        assert text.plain == "[system] info msg"
 
     @pytest.mark.asyncio
-    async def test_text_area_is_read_only(self) -> None:
-        """The transcript TextArea should be read-only for selection only."""
+    async def test_richlog_widget_exists(self) -> None:
+        """The transcript should contain a RichLog widget."""
         from textual.app import App, ComposeResult
-        from textual.widgets import TextArea
+        from textual.widgets import RichLog
 
         from nexus_orchestrator.ui.tui.widgets.transcript import TranscriptWidget
 
@@ -163,9 +163,9 @@ class TestTranscriptWidget:
         app = TestApp()
         async with app.run_test() as pilot:
             tw = app.query_one("#transcript", TranscriptWidget)
-            area = tw.query_one("#transcript-area", TextArea)
+            log = tw.query_one("#transcript-area", RichLog)
             await pilot.pause()
-            assert area.read_only is True
+            assert log is not None
 
 
 class TestComposer:
@@ -652,15 +652,15 @@ class TestStreamingUpdates:
             # Simulate streaming: append first chunk
             tw.append_event(TranscriptEvent(kind=EventKind.STDOUT, text="chunk 1"))
             await pilot.pause()
-            assert "chunk 1" in tw.text_area.text
+            assert "chunk 1" in tw.text
 
             # More chunks arrive
             tw.append_event(TranscriptEvent(kind=EventKind.STDOUT, text="chunk 2"))
             await pilot.pause()
-            assert "chunk 2" in tw.text_area.text
+            assert "chunk 2" in tw.text
 
             # First chunk is still there (incremental, not replaced)
-            assert "chunk 1" in tw.text_area.text
+            assert "chunk 1" in tw.text
 
     @pytest.mark.asyncio
     async def test_cancel_message_appears_promptly(self) -> None:
@@ -687,7 +687,7 @@ class TestStreamingUpdates:
                 TranscriptEvent(kind=EventKind.SYSTEM, text="Command cancelled.")
             )
             await pilot.pause()
-            assert "cancelled" in tw.text_area.text.lower()
+            assert "cancelled" in tw.text.lower()
 
 
 class TestSidebarFocusVisibility:
