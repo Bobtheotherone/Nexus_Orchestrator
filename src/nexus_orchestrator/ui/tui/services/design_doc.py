@@ -257,7 +257,7 @@ def _create_provider_from_auth(
         return ToolProvider(
             backend=backend,
             binary_path=auth.binary_path,
-            timeout_seconds=300.0,  # Design docs may take a while
+            timeout_seconds=7200.0,  # Design docs can take 30+ minutes
         )
 
     if auth.auth_mode == AuthMode.API_KEY:

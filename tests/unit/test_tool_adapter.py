@@ -237,7 +237,7 @@ class TestToolProviderSend:
                 backend=ToolBackend.CODEX_CLI,
                 binary_path="/usr/bin/codex",
             )
-            with pytest.raises(ProviderResponseError, match="empty output"):
+            with pytest.raises(ProviderServiceError, match="empty output"):
                 await provider.send(_make_request())
 
     @pytest.mark.asyncio

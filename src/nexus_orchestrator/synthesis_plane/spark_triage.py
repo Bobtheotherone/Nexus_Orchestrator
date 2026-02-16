@@ -35,16 +35,30 @@ _DEFAULT_TRIAGE_TIMEOUT: Final[float] = 30.0
 _MAX_SCOPE_ENTRIES: Final[int] = 15
 
 _TRIAGE_PROMPT: Final[str] = """\
-You are a task routing agent. Analyze the following software engineering task \
-and decide which AI model should handle it.
+You are a task router for a 3-model AI system. Each model has a clear purpose:
 
-Available models:
-- GPT53: Best for complex reasoning, architecture design, multi-step planning, \
-config and infrastructure tasks, design documents
-- SPARK: Best for simple/quick tasks, small fixes, formatting, documentation \
-updates, trivial single-file changes
-- OPUS: Best for deep coding logic, large refactors, writing tests, \
-parser/serializer implementation, multi-file code changes
+OPUS — The primary CODING model. Best for:
+- Writing new code across one or more files (.py, .ts, .js, .rs, .go)
+- Bug fixes, refactoring, implementing features, writing tests
+- ANY task whose scope includes source code files
+- Tasks with "implement", "fix", "refactor", "test", "build", "code" in the title
+- This should be the MOST USED model (~50% of tasks)
+
+GPT53 — The REASONING model. Only for:
+- Architecture design, system planning, strategy documents
+- Tasks that touch ONLY config/docs files (.md, .toml, .yaml, .json) with no code
+- High-level analysis, auditing, migration planning
+- Tasks where title says "design", "architect", "analyze", "plan", "review"
+- Use for ~20% of tasks
+
+SPARK — The QUICK model. Only for:
+- Very small, trivial tasks (1 file, short description, few constraints)
+- Renames, typo fixes, comment updates, formatting, changelog bumps
+- Tasks where the description is under 30 words and scope is 1 file
+- Use for ~30% of tasks
+
+IMPORTANT: If the task involves writing or modifying source code files, \
+choose OPUS. Do NOT send coding tasks to GPT53 or SPARK.
 
 Task title: {title}
 Task description: {description}

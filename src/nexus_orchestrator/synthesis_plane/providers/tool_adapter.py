@@ -18,17 +18,17 @@ from __future__ import annotations
 import asyncio
 import enum
 import json
+import re
 import shutil
 import time
 from pathlib import Path
-from typing import TYPE_CHECKING, Final
+from typing import TYPE_CHECKING, Final, NamedTuple
 
 from nexus_orchestrator.synthesis_plane.providers.base import (
     BaseProvider,
     ProviderAuthenticationError,
     ProviderRequest,
     ProviderResponse,
-    ProviderResponseError,
     ProviderServiceError,
     ProviderTimeoutError,
     ProviderUnavailableError,
@@ -91,14 +91,16 @@ class ToolProvider(BaseProvider):
         *,
         backend: ToolBackend,
         binary_path: str | None = None,
-        timeout_seconds: float = 120.0,
+        timeout_seconds: float = 600.0,
         model_catalog: ModelCatalog | None = None,
         model_flag: str = "",
+        catalog_model: str = "",
     ) -> None:
         super().__init__(model_catalog=model_catalog)
         self._backend = backend
         self._timeout_seconds = timeout_seconds
         self._model_flag = model_flag
+        self._catalog_model = catalog_model
 
         if binary_path is not None:
             self._binary_path = binary_path
@@ -139,9 +141,11 @@ class ToolProvider(BaseProvider):
         # Parse response text
         response_text = self._parse_output(stdout)
         if not response_text.strip():
-            raise ProviderResponseError(
-                f"{self._backend.value} returned empty output",
+            raise ProviderServiceError(
+                f"{self._backend.value} returned empty output "
+                f"(stdout={len(stdout)} bytes, returncode={returncode})",
                 provider="tool",
+                retryable=True,
             )
 
         return ProviderResponse(
@@ -180,7 +184,8 @@ class ToolProvider(BaseProvider):
 
         stdout_chunks: list[bytes] = []
         stderr_chunks: list[bytes] = []
-        backend_tag = "codex" if self._backend == ToolBackend.CODEX_CLI else "claude"
+        model_tag = _model_tag_for(self._catalog_model, self._backend)
+        palette = _palette_for_model(self._catalog_model)
 
         async def _feed_stdin() -> None:
             if stdin_data is not None and proc.stdin is not None:
@@ -197,7 +202,7 @@ class ToolProvider(BaseProvider):
                     if not line:
                         break
                     stdout_chunks.append(line)
-                    _echo_stream_event(line, backend_tag)
+                    _echo_stream_event(line, model_tag, palette)
             else:
                 # Codex: read in chunks (raw text result)
                 while True:
@@ -208,15 +213,48 @@ class ToolProvider(BaseProvider):
 
         async def _read_stderr() -> None:
             assert proc.stderr is not None  # noqa: S101
+            # Throttle stderr echo to prevent output flooding.
+            # Codex CLI writes full file diffs to stderr; without
+            # throttling this generates thousands of transcript lines.
+            _echoed = 0
+            _max_echo = 200  # max lines echoed per invocation
+            _suppressed = 0
+            _quiet_mode = False
+            # Patterns worth echoing even in quiet mode
+            _important_re = re.compile(
+                r"(Agent complete|error|Error|ERROR|tokens used|"
+                r"---\s*(Write|Edit|Bash).*---|---\s*end\s*---)",
+            )
             while True:
                 line = await proc.stderr.readline()
                 if not line:
                     break
                 stderr_chunks.append(line)
-                # Echo stderr to parent stdout for TUI visibility
                 text = line.decode("utf-8", errors="replace").rstrip()
-                if text:
-                    print(f"  [{backend_tag}] {text}", flush=True)
+                if not text:
+                    continue
+                if not _quiet_mode:
+                    _echoed += 1
+                    if _echoed > _max_echo:
+                        _quiet_mode = True
+                        _emit(
+                            f"  [{model_tag}] ... (verbose output suppressed, "
+                            f"showing summaries only)",
+                            palette.text,
+                        )
+                    else:
+                        _emit(f"  [{model_tag}] {text}", palette.text)
+                else:
+                    # In quiet mode, only echo important lines
+                    if _important_re.search(text):
+                        _emit(f"  [{model_tag}] {text}", palette.text)
+                    else:
+                        _suppressed += 1
+            if _suppressed > 0:
+                _emit(
+                    f"  [{model_tag}] ({_suppressed} verbose lines suppressed)",
+                    palette.text,
+                )
 
         try:
             await asyncio.wait_for(
@@ -342,11 +380,11 @@ def _assemble_prompt(request: ProviderRequest) -> str:
     return "\n".join(parts)
 
 
-def _echo_stream_event(raw_line: bytes, tag: str) -> None:
+def _echo_stream_event(raw_line: bytes, tag: str, palette: _ModelPalette) -> None:
     """Parse a stream-json line and echo relevant content for TUI visibility.
 
     Shows full agent output including code from tool_use blocks with
-    blue-themed ANSI coloring.
+    model-specific ANSI coloring (green=GPT, orange=Anthropic, blue=system).
     """
     text = raw_line.decode("utf-8", errors="replace").strip()
     if not text:
@@ -375,15 +413,15 @@ def _echo_stream_event(raw_line: bytes, tag: str) -> None:
                     for line in block_text.splitlines():
                         line = line.strip()
                         if line:
-                            _emit(f"  [{tag}] {line}", _CLR_TEXT)
+                            _emit(f"  [{tag}] {line}", palette.text)
             elif block_type == "tool_use":
                 tool_name = block.get("name", "?")
                 tool_input = block.get("input", {})
                 summary = _summarize_tool_use(tool_name, tool_input)
-                _emit(f"  [{tag}] {summary}", _CLR_TOOL_HEADER)
+                _emit(f"  [{tag}] {summary}", palette.tool_header)
                 # Show full code content from tool_use blocks
                 for code_line in _format_tool_code(tool_name, tool_input):
-                    _emit(f"  [{tag}] {code_line}", _CLR_CODE)
+                    _emit(f"  [{tag}] {code_line}", palette.code)
 
     elif event_type == "result":
         subtype = event.get("subtype", "done")
@@ -394,17 +432,73 @@ def _echo_stream_event(raw_line: bytes, tag: str) -> None:
             parts.append(f"{dur / 1000:.1f}s")
         if isinstance(cost, (int, float)):
             parts.append(f"${cost:.4f}")
-        _emit(f"  [{tag}] {' | '.join(parts)}", _CLR_RESULT)
+        _emit(f"  [{tag}] {' | '.join(parts)}", palette.result)
 
 
-# --- ANSI blue-theme color codes (24-bit true color) ---
+# --- ANSI 24-bit true color codes ---
 _CLR_RESET: Final[str] = "\033[0m"
-_CLR_TOOL_HEADER: Final[str] = "\033[1;38;2;63;169;245m"     # #3fa9f5 bold
-_CLR_FILE_PATH: Final[str] = "\033[38;2;114;199;255m"        # #72c7ff
-_CLR_CODE: Final[str] = "\033[38;2;200;205;216m"             # #c8cdd8
-_CLR_TEXT: Final[str] = "\033[38;2;127;138;163m"              # #7f8aa3
-_CLR_SEPARATOR: Final[str] = "\033[38;2;26;37;80m"           # #1a2550
-_CLR_RESULT: Final[str] = "\033[38;2;78;201;144m"            # #4ec990
+
+
+class _ModelPalette(NamedTuple):
+    """ANSI color palette for a model family."""
+
+    tool_header: str
+    file_path: str
+    code: str
+    text: str
+    result: str
+
+
+# Green palette — GPT models (codex_gpt53, codex_spark)
+_PALETTE_GREEN: Final[_ModelPalette] = _ModelPalette(
+    tool_header="\033[1;38;2;78;201;144m",   # #4ec990 bold
+    file_path="\033[38;2;126;232;181m",       # #7ee8b5
+    code="\033[38;2;200;230;208m",            # #c8e6d0
+    text="\033[38;2;125;163;138m",            # #7da38a
+    result="\033[1;38;2;78;201;144m",         # #4ec990 bold
+)
+
+# Orange palette — Anthropic models (claude_opus)
+_PALETTE_ORANGE: Final[_ModelPalette] = _ModelPalette(
+    tool_header="\033[1;38;2;245;166;35m",    # #f5a623 bold
+    file_path="\033[38;2;255;200;112m",       # #ffc870
+    code="\033[38;2;230;216;200m",            # #e6d8c8
+    text="\033[38;2;163;137;127m",            # #a3897f
+    result="\033[1;38;2;245;166;35m",         # #f5a623 bold
+)
+
+# Blue palette — system/nexus and legacy fallback
+_PALETTE_BLUE: Final[_ModelPalette] = _ModelPalette(
+    tool_header="\033[1;38;2;63;169;245m",    # #3fa9f5 bold
+    file_path="\033[38;2;114;199;255m",       # #72c7ff
+    code="\033[38;2;200;205;216m",            # #c8cdd8
+    text="\033[38;2;127;138;163m",            # #7f8aa3
+    result="\033[38;2;78;201;144m",           # #4ec990
+)
+
+# Model-specific tag names for TUI display
+_MODEL_TAG_MAP: Final[dict[str, str]] = {
+    "codex_gpt53": "gpt53",
+    "codex_spark": "spark",
+    "claude_opus": "opus",
+}
+
+
+def _model_tag_for(catalog_model: str, backend: ToolBackend) -> str:
+    """Return a short display tag for the given catalog model."""
+    tag = _MODEL_TAG_MAP.get(catalog_model)
+    if tag:
+        return tag
+    return "codex" if backend == ToolBackend.CODEX_CLI else "claude"
+
+
+def _palette_for_model(catalog_model: str) -> _ModelPalette:
+    """Return the color palette for the given catalog model name."""
+    if catalog_model in ("codex_gpt53", "codex_spark"):
+        return _PALETTE_GREEN
+    if catalog_model in ("claude_opus",):
+        return _PALETTE_ORANGE
+    return _PALETTE_BLUE
 
 
 def _emit(line: str, color: str = "") -> None:
@@ -415,34 +509,55 @@ def _emit(line: str, color: str = "") -> None:
         print(line, flush=True)
 
 
+# Maximum code lines shown per tool block before truncation.
+# Keeps transcript readable and prevents output flooding.
+_MAX_TOOL_CODE_LINES: Final[int] = 30
+
+
 def _format_tool_code(name: str, inputs: object) -> list[str]:
-    """Extract and format code content from a tool_use block."""
+    """Extract and format code content from a tool_use block.
+
+    Truncates after _MAX_TOOL_CODE_LINES to prevent flooding.
+    """
     if not isinstance(inputs, dict):
         return []
     lines: list[str] = []
+    limit = _MAX_TOOL_CODE_LINES
 
     if name in ("Write", "write") and "content" in inputs:
         file_path = inputs.get("file_path", "?")
-        lines.append(f"  --- Write: {file_path} ---")
-        for code_line in str(inputs["content"]).splitlines():
+        content_lines = str(inputs["content"]).splitlines()
+        lines.append(f"  --- Write: {file_path} ({len(content_lines)} lines) ---")
+        for code_line in content_lines[:limit]:
             lines.append(f"  | {code_line}")
+        if len(content_lines) > limit:
+            lines.append(f"  ... ({len(content_lines) - limit} more lines)")
         lines.append("  --- end ---")
 
     elif name in ("Edit", "edit") and "new_string" in inputs:
         file_path = inputs.get("file_path", "?")
         lines.append(f"  --- Edit: {file_path} ---")
         if "old_string" in inputs:
-            for code_line in str(inputs["old_string"]).splitlines():
+            old_lines = str(inputs["old_string"]).splitlines()
+            for code_line in old_lines[:limit]:
                 lines.append(f"  - {code_line}")
+            if len(old_lines) > limit:
+                lines.append(f"  ... ({len(old_lines) - limit} more lines)")
             lines.append("  >>>")
-        for code_line in str(inputs["new_string"]).splitlines():
+        new_lines = str(inputs["new_string"]).splitlines()
+        for code_line in new_lines[:limit]:
             lines.append(f"  + {code_line}")
+        if len(new_lines) > limit:
+            lines.append(f"  ... ({len(new_lines) - limit} more lines)")
         lines.append("  --- end ---")
 
     elif name in ("Bash", "bash") and "command" in inputs:
+        cmd_lines = str(inputs["command"]).splitlines()
         lines.append("  --- Bash ---")
-        for code_line in str(inputs["command"]).splitlines():
+        for code_line in cmd_lines[:limit]:
             lines.append(f"  $ {code_line}")
+        if len(cmd_lines) > limit:
+            lines.append(f"  ... ({len(cmd_lines) - limit} more lines)")
         lines.append("  --- end ---")
 
     return lines
@@ -467,38 +582,74 @@ def _summarize_tool_use(name: str, inputs: object) -> str:
 def _parse_claude_stream_output(stdout: str) -> str:
     """Parse Claude Code stream-json output to extract the final result.
 
-    Stream-json format is JSONL where the last event with type="result"
-    contains the final output. Falls back to the legacy JSON parser if
-    no result event is found.
+    Stream-json format is JSONL.  We try three strategies in order:
+
+    1. Find a ``type="result"`` event and extract its ``result`` field.
+    2. Collect all text blocks from ``type="assistant"`` events.
+    3. Fall back to the legacy single-JSON parser.
+
+    This robustness is important because the CLI may crash, timeout,
+    or omit the final result event while still having produced useful
+    assistant output earlier in the stream.
     """
-    # Scan from the end for the result event (usually the last line)
-    for line in reversed(stdout.splitlines()):
-        line = line.strip()
-        if not line:
+    lines = stdout.splitlines()
+
+    # Strategy 1 — look for a result event (scan from end)
+    for raw_line in reversed(lines):
+        raw_line = raw_line.strip()
+        if not raw_line:
             continue
         try:
-            event = json.loads(line)
+            event = json.loads(raw_line)
         except (json.JSONDecodeError, ValueError):
             continue
         if event.get("type") != "result":
             continue
 
         result = event.get("result")
-        if isinstance(result, str):
+        if isinstance(result, str) and result.strip():
             return result
-        # Result may be a list of content blocks
         if isinstance(result, list):
-            texts: list[str] = []
-            for block in result:
-                if isinstance(block, dict) and block.get("type") == "text":
-                    t = block.get("text", "")
-                    if isinstance(t, str):
-                        texts.append(t)
+            texts = _extract_text_blocks(result)
             if texts:
                 return "\n".join(texts)
 
-    # Fallback: try legacy single-JSON parser
+    # Strategy 2 — collect all text from assistant events
+    all_texts: list[str] = []
+    for raw_line in lines:
+        raw_line = raw_line.strip()
+        if not raw_line:
+            continue
+        try:
+            event = json.loads(raw_line)
+        except (json.JSONDecodeError, ValueError):
+            continue
+        if event.get("type") != "assistant":
+            continue
+        message = event.get("message")
+        if not isinstance(message, dict):
+            continue
+        content = message.get("content")
+        if isinstance(content, list):
+            all_texts.extend(_extract_text_blocks(content))
+    if all_texts:
+        return "\n".join(all_texts)
+
+    # Strategy 3 — legacy single-JSON parser
     return _parse_claude_json_fallback(stdout)
+
+
+def _extract_text_blocks(content: list[object]) -> list[str]:
+    """Extract text from a list of content blocks."""
+    texts: list[str] = []
+    for block in content:
+        if not isinstance(block, dict):
+            continue
+        if block.get("type") == "text":
+            t = block.get("text", "")
+            if isinstance(t, str) and t.strip():
+                texts.append(t)
+    return texts
 
 
 def _parse_claude_json_fallback(stdout: str) -> str:
@@ -536,4 +687,5 @@ __all__ = [
     "TOOL_MODEL_SPEC",
     "ToolBackend",
     "ToolProvider",
+    "_palette_for_model",
 ]

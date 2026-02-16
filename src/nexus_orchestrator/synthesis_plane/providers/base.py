@@ -28,6 +28,7 @@ import json
 import random as random_module
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Protocol, TypeAlias, TypeVar, cast, runtime_checkable
 
 from nexus_orchestrator.security.redaction import redact_text
@@ -413,6 +414,7 @@ class ProviderRequest:
     idempotency_key: str | None
     budget: BudgetSnapshot | None
     metadata: Mapping[str, JSONValue]
+    workspace_dir: Path | None
 
     def __init__(
         self,
@@ -433,6 +435,7 @@ class ProviderRequest:
         idempotency_key: str | None = None,
         budget: BudgetSnapshot | None = None,
         metadata: Mapping[str, object] | None = None,
+        workspace_dir: Path | None = None,
         # Backward-compatible names.
         role: str | None = None,
         prompt: str | None = None,
@@ -540,6 +543,10 @@ class ProviderRequest:
             dict(metadata_payload), path="ProviderRequest.metadata"
         )
 
+        if workspace_dir is not None and not isinstance(workspace_dir, Path):
+            raise TypeError("ProviderRequest.workspace_dir must be a Path or None")
+        self.workspace_dir = workspace_dir
+
     @property
     def role(self) -> str:
         """Backward-compatible alias."""
@@ -604,6 +611,8 @@ class ProviderRequest:
             payload["idempotency_key"] = self.idempotency_key
         if self.budget is not None:
             payload["budget"] = self.budget.to_dict()
+        if self.workspace_dir is not None:
+            payload["workspace_dir"] = str(self.workspace_dir)
         return payload
 
 

@@ -141,20 +141,18 @@ class TestClassifyWorkItem:
         assert classify_work_item(wi) == ModelAffinity.GPT53
 
     def test_simple_task_returns_spark(self) -> None:
-        """Mixed signals (middle ground) → SPARK (-2 ≤ score ≤ 2).
+        """Trivial single-file task with short description → SPARK.
 
-        Balanced scope (1 code file + 1 config file = tie → 0),
-        balanced keywords (1 code + 1 architecture → tie → 0),
-        medium risk (→ 0), moderate constraints (→ 0).
-        Total score = 0, which falls in SPARK range.
+        Single config file scope, spark-like keywords (rename/trivial),
+        few constraints, short description.
         """
         wi = _make_work_item(
             3,
-            title="Review the handler setup",
-            description="Audit the configuration for correctness",
-            scope=("src/handler.py", "config/settings.toml"),
+            title="Rename the settings variable",
+            description="Trivial rename in config file",
+            scope=("config/settings.toml",),
             risk_tier=RiskTier.MEDIUM,
-            constraint_count=2,
+            constraint_count=1,
         )
         result = classify_work_item(wi)
         assert result == ModelAffinity.SPARK

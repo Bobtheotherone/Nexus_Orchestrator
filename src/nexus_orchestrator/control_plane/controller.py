@@ -4,13 +4,15 @@ from __future__ import annotations
 
 import asyncio
 import re
+import threading
 import warnings
 from collections import defaultdict
 from collections.abc import Mapping, Sequence
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from threading import RLock
+from threading import RLock, Semaphore
 from typing import Final, TypeAlias, cast
 
 from nexus_orchestrator.config.schema import assert_valid_config, default_config, merge_config
@@ -185,6 +187,62 @@ class _DeterministicMockProvider:
         )
 
 
+# --- Per-thread event loop management ---
+# Avoids "Event loop is closed" errors caused by asyncio.run() creating
+# and destroying a loop per call.  Subprocess transports are GC'd after
+# the loop closes, triggering RuntimeError.  Reusing a single loop per
+# thread prevents this.
+_thread_loop: threading.local = threading.local()
+
+
+def _run_async(coro: object) -> object:
+    """Run an async coroutine using a per-thread reusable event loop.
+
+    Unlike ``asyncio.run()`` this keeps the loop alive across calls in
+    the same thread, preventing "Event loop is closed" errors from
+    subprocess transport GC.
+    """
+    loop: asyncio.AbstractEventLoop | None = getattr(_thread_loop, "loop", None)
+    if loop is None or loop.is_closed():
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        _thread_loop.loop = loop
+    return loop.run_until_complete(coro)  # type: ignore[arg-type]
+
+
+def _suppress_event_loop_gc_errors() -> None:
+    """Silence subprocess transport GC errors from worker threads.
+
+    When subprocess transports are garbage-collected after the event loop
+    closes (common in thread pools), Python emits RuntimeError via
+    sys.unraisablehook.  These are cosmetic — suppress them globally.
+    """
+    import atexit
+    import sys
+
+    _original_hook = sys.unraisablehook
+
+    def _quiet_hook(unraisable: sys.UnraisableHookArgs) -> None:
+        if (
+            isinstance(unraisable.exc_value, RuntimeError)
+            and "Event loop is closed" in str(unraisable.exc_value)
+        ):
+            return  # suppress
+        _original_hook(unraisable)
+
+    sys.unraisablehook = _quiet_hook
+
+    def _cleanup() -> None:
+        loop = getattr(_thread_loop, "loop", None)
+        if loop is not None and not loop.is_closed():
+            loop.close()
+
+    atexit.register(_cleanup)
+
+
+_suppress_event_loop_gc_errors()
+
+
 class OrchestratorController:
     """Controller coordinating ingest -> plan -> dispatch -> verify -> merge."""
 
@@ -220,6 +278,17 @@ class OrchestratorController:
         self._lock = RLock()
         self._crash_after_attempts = crash_after_attempts
         self._attempts_processed = 0
+
+        # Per-backend concurrency limits.
+        # Claude CLI cannot handle many concurrent instances (auth/session conflicts).
+        # Codex CLI handles concurrency well.
+        self._claude_semaphore = Semaphore(2)
+        self._codex_semaphore = Semaphore(6)
+
+        # Round-robin distribution state: prevents all items routing to one model
+        self._rr_counter: int = 0
+        self._rr_last_affinity: ModelAffinity | None = None
+        self._rr_consecutive: int = 0
 
     @property
     def state_db_path(self) -> Path:
@@ -449,31 +518,72 @@ class OrchestratorController:
 
                 batch_ids = tuple(item.id for item in runnable)
                 self._append_dispatch_batch(current_run.id, batch_ids)
-                for work_item in runnable:
-                    items_processed += 1
-                    self._log(f"[{items_processed}/{total_items}] {work_item.title}")
-                    self._process_work_item(
-                        run_id=current_run.id,
-                        work_item=work_item,
-                        effective_config=effective_config,
-                        role_registry=role_registry,
-                        model_catalog=model_catalog,
-                        warned_models=warned_models,
-                        warning_messages=warning_messages,
-                        mock=mock,
-                        git_engine=git_engine,
-                        workspace_manager=workspace_manager,
-                        merge_queue=merge_queue,
-                        evidence_root=evidence_root,
-                    )
 
-                    if (
-                        self._crash_after_attempts is not None
-                        and self._attempts_processed >= self._crash_after_attempts
-                    ):
-                        raise SimulatedCrashError(
-                            f"simulated crash after {self._attempts_processed} processed attempt(s)"
+                # --- Parallel dispatch ---
+                # Dispatch all work items in the batch concurrently.
+                # Each thread gets its own asyncio event loop (via asyncio.run).
+                max_workers = min(len(runnable), self._parallel_workers(effective_config))
+                self._log(f"Dispatching batch of {len(runnable)} (workers={max_workers})")
+
+                if max_workers <= 1:
+                    # Sequential fallback (mock mode or single item)
+                    for work_item in runnable:
+                        items_processed += 1
+                        self._log(f"[{items_processed}/{total_items}] {work_item.title}")
+                        self._process_work_item(
+                            run_id=current_run.id,
+                            work_item=work_item,
+                            effective_config=effective_config,
+                            role_registry=role_registry,
+                            model_catalog=model_catalog,
+                            warned_models=warned_models,
+                            warning_messages=warning_messages,
+                            mock=mock,
+                            git_engine=git_engine,
+                            workspace_manager=workspace_manager,
+                            merge_queue=merge_queue,
+                            evidence_root=evidence_root,
                         )
+                else:
+                    # Concurrent dispatch via thread pool
+                    futures: dict[object, WorkItem] = {}
+                    with ThreadPoolExecutor(
+                        max_workers=max_workers,
+                        thread_name_prefix="nexus-dispatch",
+                    ) as pool:
+                        for work_item in runnable:
+                            items_processed += 1
+                            self._log(f"[{items_processed}/{total_items}] {work_item.title}")
+                            future = pool.submit(
+                                self._process_work_item,
+                                run_id=current_run.id,
+                                work_item=work_item,
+                                effective_config=effective_config,
+                                role_registry=role_registry,
+                                model_catalog=model_catalog,
+                                warned_models=warned_models,
+                                warning_messages=warning_messages,
+                                mock=mock,
+                                git_engine=git_engine,
+                                workspace_manager=workspace_manager,
+                                merge_queue=merge_queue,
+                                evidence_root=evidence_root,
+                            )
+                            futures[future] = work_item
+                        for future in as_completed(futures):
+                            try:
+                                future.result()
+                            except Exception as exc:  # noqa: BLE001
+                                wi = futures[future]
+                                self._log(f"  Worker error [{wi.id}]: {exc}")
+
+                if (
+                    self._crash_after_attempts is not None
+                    and self._attempts_processed >= self._crash_after_attempts
+                ):
+                    raise SimulatedCrashError(
+                        f"simulated crash after {self._attempts_processed} processed attempt(s)"
+                    )
 
                 self._drain_merge_queue(
                     run_id=current_run.id,
@@ -687,7 +797,11 @@ class OrchestratorController:
                 dispatch_budget=dispatch_plan.dispatch_budget,
             )
 
-        self._log(f"  Dispatching via {dispatch_plan.decision.model}...")
+        _dispatch_tag_map = {
+            "codex_gpt53": "gpt53", "codex_spark": "spark", "claude_opus": "opus",
+        }
+        _dtag = _dispatch_tag_map.get(dispatch_plan.decision.model, dispatch_plan.decision.model)
+        self._log(f"  [{_dtag}] Dispatching via {dispatch_plan.decision.model}...")
         dispatch_outcome = self._dispatch_one(
             run_id=run_id,
             dispatch_plan=dispatch_plan,
@@ -859,6 +973,7 @@ class OrchestratorController:
         model_catalog: ModelCatalog,
         workspace_cwd: Path | None = None,
     ) -> _DispatchOutcome:
+        model_name = dispatch_plan.decision.model
         if mock:
             patch_by_work_item = {
                 dispatch_plan.work_item.id: self._mock_patch_for_work_item(dispatch_plan.work_item),
@@ -892,7 +1007,6 @@ class OrchestratorController:
             _name_to_enum = {"codex": ToolBackend.CODEX_CLI, "claude": ToolBackend.CLAUDE_CODE}
 
             # Pick backend matching the escalation model when possible
-            model_name = dispatch_plan.decision.model
             _model_to_backend = {
                 "codex_cli": "codex",
                 "claude_code": "claude",
@@ -900,13 +1014,48 @@ class OrchestratorController:
                 "codex_spark": "codex",
                 "claude_opus": "claude",
             }
+            # Cross-backend fallback: when the preferred backend (e.g. claude)
+            # is not installed, remap to the best equivalent on the available
+            # backend so we don't pass an incompatible --model flag.
+            _CROSS_BACKEND_FALLBACK: dict[str, str] = {
+                # claude model → best codex equivalent
+                "claude_opus": "codex_gpt53",
+                "claude_code": "codex_cli",
+                # codex model → best claude equivalent
+                "codex_gpt53": "claude_opus",
+                "codex_spark": "claude_code",
+                "codex_cli": "claude_code",
+            }
+            available_backend_names = {bi.name for bi in backends}
             preferred_name = _model_to_backend.get(model_name)
             backend_info = backends[0]  # default: first detected
+            backend_matched = False
             if preferred_name is not None:
                 for bi in backends:
                     if bi.name == preferred_name:
                         backend_info = bi
+                        backend_matched = True
                         break
+
+            if not backend_matched and preferred_name is not None:
+                # Preferred backend not available — remap model
+                fallback_model = _CROSS_BACKEND_FALLBACK.get(model_name)
+                if fallback_model:
+                    _tag_map = {
+                        "codex_gpt53": "gpt53", "codex_spark": "spark",
+                        "claude_opus": "opus",
+                    }
+                    self._log(
+                        f"  [{_tag_map.get(model_name, model_name)}] "
+                        f"{preferred_name} CLI not installed, falling back to "
+                        f"{fallback_model}"
+                    )
+                    model_name = fallback_model
+                    preferred_name = _model_to_backend.get(model_name)
+                    for bi in backends:
+                        if bi.name == preferred_name:
+                            backend_info = bi
+                            break
 
             backend_enum = _name_to_enum.get(backend_info.name)
             if backend_enum is None:
@@ -939,6 +1088,7 @@ class OrchestratorController:
                     timeout_seconds=timeout_seconds,
                     model_catalog=model_catalog,
                     model_flag=model_flag,
+                    catalog_model=model_name,
                 )
             except Exception as exc:  # noqa: BLE001
                 return _DispatchOutcome(
@@ -999,8 +1149,20 @@ class OrchestratorController:
                 "orchestrator_repo_root": str(self._repo_root),
             },
         )
+        # Acquire per-backend semaphore to limit concurrent CLI instances.
+        # Claude CLI cannot handle many concurrent sessions.
+        _backend_for_sem = {
+            "codex_gpt53": "codex", "codex_spark": "codex",
+            "claude_opus": "claude", "codex_cli": "codex", "claude_code": "claude",
+        }
+        sem_key = _backend_for_sem.get(model_name, "codex")
+        sem = self._claude_semaphore if sem_key == "claude" else self._codex_semaphore
         try:
-            dispatch_result = asyncio.run(controller.dispatch(request))
+            sem.acquire()
+            try:
+                dispatch_result = _run_async(controller.dispatch(request))
+            finally:
+                sem.release()
         except KeyboardInterrupt:
             return _DispatchOutcome(
                 plan=dispatch_plan,
@@ -1042,6 +1204,44 @@ class OrchestratorController:
             dispatch_result_cost_usd=dispatch_result.cost_usd,
         )
 
+    # Round-robin distribution order: OPUS gets 50%, GPT53 20%, SPARK 30%.
+    # Pattern repeats every 10 items: OPUS×5, SPARK×3, GPT53×2.
+    _RR_SEQUENCE: tuple[ModelAffinity, ...] = (
+        ModelAffinity.OPUS,
+        ModelAffinity.SPARK,
+        ModelAffinity.OPUS,
+        ModelAffinity.GPT53,
+        ModelAffinity.OPUS,
+        ModelAffinity.SPARK,
+        ModelAffinity.OPUS,
+        ModelAffinity.SPARK,
+        ModelAffinity.OPUS,
+        ModelAffinity.GPT53,
+    )
+
+    def _apply_round_robin(self, affinity: ModelAffinity) -> ModelAffinity:
+        """Force model distribution when triage keeps picking the same model.
+
+        If the triage/classifier returns the same model 3+ times consecutively,
+        override with a round-robin distribution to ensure all three models
+        get used.  This prevents homogeneous work item batches from
+        overloading a single model.
+        """
+        if affinity == self._rr_last_affinity:
+            self._rr_consecutive += 1
+        else:
+            self._rr_last_affinity = affinity
+            self._rr_consecutive = 1
+
+        if self._rr_consecutive >= 3:
+            # Force distribution
+            forced = self._RR_SEQUENCE[self._rr_counter % len(self._RR_SEQUENCE)]
+            self._rr_counter += 1
+            self._log(f"  Round-robin override: {affinity.value} → {forced.value}")
+            return forced
+
+        return affinity
+
     def _triage_work_item(
         self,
         work_item: WorkItem,
@@ -1068,7 +1268,7 @@ class OrchestratorController:
             return affinity
 
         try:
-            triage_result = asyncio.run(triage_with_spark(
+            triage_result = _run_async(triage_with_spark(
                 work_item, timeout_seconds=triage_timeout,
             ))
         except Exception:  # noqa: BLE001
@@ -1118,6 +1318,12 @@ class OrchestratorController:
             if "tool" in profile_models:
                 # Try Spark LLM triage first, fall back to deterministic classifier
                 affinity = self._triage_work_item(work_item, effective_config)
+
+                # Round-robin: prevent all items routing to a single model.
+                # When triage picks the same model 3+ times in a row, force
+                # distribution across the three models.
+                affinity = self._apply_round_robin(affinity)
+
                 ladder = resolve_tool_ladder_for_affinity(affinity, profile_models)
                 decision = ladder.resolve_attempt(attempt_number)
 
@@ -1604,8 +1810,17 @@ class OrchestratorController:
     def _batch_limit(self, config: Mapping[str, object]) -> int:
         resources_cfg = _nested_mapping_get(config, ("resources",))
         return _as_int(
-            resources_cfg.get("max_light_verification") if resources_cfg is not None else None,
-            default=2,
+            resources_cfg.get("max_concurrent_work_items") if resources_cfg is not None else None,
+            default=8,
+            minimum=1,
+        )
+
+    def _parallel_workers(self, config: Mapping[str, object]) -> int:
+        """Return the number of parallel dispatch workers for the thread pool."""
+        resources_cfg = _nested_mapping_get(config, ("resources",))
+        return _as_int(
+            resources_cfg.get("max_parallel_dispatch") if resources_cfg is not None else None,
+            default=6,
             minimum=1,
         )
 
@@ -1645,28 +1860,64 @@ class OrchestratorController:
         constraint_ids = ", ".join(
             constraint.id for constraint in work_item.constraint_envelope.constraints
         )
-        lines = [
-            f"Role: {ROLE_IMPLEMENTER}",
-            f"Provider: {decision.provider}",
-            f"Model: {decision.model}",
-            f"Attempt: {attempt_number}",
-            f"WorkItemId: {work_item.id}",
+
+        # --- System instructions ---
+        system_lines = [
+            "You are an IMPLEMENTATION agent. Your sole job is to produce "
+            "working code that satisfies the task below.",
+            "",
+            "WORKFLOW — follow these steps IN ORDER:",
+            "1. SCAN (≤2 min): Read the design_document.md and a few key source "
+            "   files to understand the codebase structure. Do NOT exhaustively "
+            "   explore every file.",
+            "2. PLAN (≤1 min): Decide which files to create or modify and what "
+            "   each change should contain.",
+            "3. IMPLEMENT (majority of time): Use the Write tool to create new "
+            "   files and the Edit tool to modify existing files. Produce real, "
+            "   working code — not summaries, analyses, or explanations.",
+            "4. VERIFY: Run any existing tests (e.g., `pytest`) to confirm your "
+            "   changes work.",
+            "",
+            "CRITICAL RULES:",
+            "- You MUST call Write or Edit to produce code. A run that only "
+            "  reads files is a FAILURE.",
+            "- Spend at most 20% of your time reading. Spend at least 80% writing.",
+            "- If you are unsure what to write, write your best implementation. "
+            "  An imperfect implementation is better than no implementation.",
+            "- Do NOT ask for clarification. Do NOT explain what you would do. "
+            "  Just implement it.",
+        ]
+
+        if workspace_dir is not None:
+            system_lines.extend([
+                "",
+                "WORKSPACE: You are in an isolated git worktree.",
+                "All file modifications MUST stay within the current working "
+                "directory. Do NOT access files outside of it.",
+            ])
+        else:
+            system_lines.extend([
+                "",
+                "OUTPUT: Return a unified git patch (diff format).",
+            ])
+
+        # --- Task specification ---
+        task_lines = [
+            "",
+            "═══ TASK ═══",
             f"Title: {work_item.title}",
             f"Description: {work_item.description}",
-            f"Scope: {scope}",
+            f"Scope files: {scope}",
             f"Dependencies: {dependencies}",
             f"Constraints: {constraint_ids}",
+            f"Attempt: {attempt_number}",
+            f"WorkItemId: {work_item.id}",
+            "",
+            "Implement the above requirement now. Start scanning, "
+            "then write the code.",
         ]
-        if workspace_dir is not None:
-            lines.append(
-                "You are working in an isolated git worktree. "
-                "All file modifications MUST stay within the current working "
-                "directory. Do NOT access, read, or modify files outside of it. "
-                "Implement the requested changes by editing files directly."
-            )
-        else:
-            lines.append("Return only a unified git patch.")
-        return "\n".join(lines)
+
+        return "\n".join(system_lines + task_lines)
 
     def _mock_patch_for_work_item(self, work_item: WorkItem) -> str:
         module_suffix = self._module_suffix(work_item)

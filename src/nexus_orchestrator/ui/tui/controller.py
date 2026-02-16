@@ -17,6 +17,7 @@ import asyncio
 import os
 import shutil
 import subprocess
+import time
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
 from pathlib import Path
@@ -185,6 +186,11 @@ class TUIController:
             path = parts[1].strip() if len(parts) > 1 else ""
             await self._handle_export(path)
 
+        elif cmd == "/progress":
+            # View layer handles this — signal via system event
+            self.append_system("__SHOW_PROGRESS__")
+            await self._notify()
+
         elif cmd in ("/run", "/exec"):
             parts = command.split(maxsplit=1)
             if len(parts) < 2 or not parts[1].strip():
@@ -227,11 +233,11 @@ class TUIController:
         return "\n".join(lines)
 
     async def _handle_copy(self) -> None:
-        """Copy last output (or full transcript) to clipboard via best-effort.
+        """Copy full transcript to clipboard via best-effort.
 
         Falls back to export if clipboard is unavailable.
         """
-        text = self.state.last_output or self._transcript_as_text()
+        text = self._transcript_as_text() or self.state.last_output or ""
         if not text.strip():
             self.append_system("Nothing to copy.")
             await self._notify()
@@ -246,7 +252,7 @@ class TUIController:
             # Fallback: auto-export to file with the text we wanted to copy
             await self._handle_export("", override_text=text)
             self.append_system(
-                "Clipboard not available (install xclip, xsel, or wl-copy). "
+                "Clipboard not available (install xclip, xsel, wl-copy, or use clip.exe on WSL). "
                 "Transcript exported to file instead."
             )
         await self._notify()
@@ -312,8 +318,13 @@ class TUIController:
         )
         await self._notify()
 
+        heartbeat_task: asyncio.Task[None] | None = None
         try:
             generator = self._ensure_design_doc_generator()
+            start = time.monotonic()
+            heartbeat_task = asyncio.create_task(
+                self._heartbeat_loop(start)
+            )
             result = await generator.generate(prompt)
 
             for line in result.content.splitlines():
@@ -323,8 +334,12 @@ class TUIController:
             await self._notify()
 
             saved_msg = f"Saved to {result.file_path}" if result.file_path else "Not saved to disk"
+            elapsed = time.monotonic() - start
+            elapsed_min = int(elapsed) // 60
+            elapsed_sec = int(elapsed) % 60
             self.append_system(
-                f"Design doc generated ({result.model}, "
+                f"Design doc generated in {elapsed_min}m {elapsed_sec}s "
+                f"({result.model}, "
                 f"{result.tokens_used} tokens, ${result.cost_usd:.4f}). "
                 f"{saved_msg}"
             )
@@ -343,11 +358,31 @@ class TUIController:
                 self.append_system(str(exc))
             else:
                 self.append_system(f"Design doc generation failed: {exc}")
+        finally:
+            if heartbeat_task is not None:
+                heartbeat_task.cancel()
+                try:
+                    await heartbeat_task
+                except asyncio.CancelledError:
+                    pass
 
         self.state.runner_status = RunnerStatus.IDLE
         self.state.current_command = ""
         self._run_task = None
         await self._notify()
+
+    async def _heartbeat_loop(self, start: float) -> None:
+        """Emit periodic heartbeat messages during long-running generation."""
+        interval = 30  # seconds between heartbeats
+        while True:
+            await asyncio.sleep(interval)
+            elapsed = time.monotonic() - start
+            minutes = int(elapsed) // 60
+            seconds = int(elapsed) % 60
+            self.append_system(
+                f"Still generating design doc... ({minutes}m {seconds}s elapsed)"
+            )
+            await self._notify()
 
     # ------------------------------------------------------------------
     # Runner integration
@@ -367,13 +402,13 @@ class TUIController:
         await self._notify()
 
         exit_code = 1
-        last_stdout = ""
+        stdout_lines: list[str] = []
 
         try:
             async for event in self._runner.run(command):
                 await self._reduce_runner_event(event)
                 if event.kind == RunnerEventKind.STDOUT_LINE:
-                    last_stdout = event.text
+                    stdout_lines.append(event.text)
                 if event.kind == RunnerEventKind.FINISHED:
                     exit_code = event.exit_code or 0
         except Exception as exc:
@@ -381,20 +416,40 @@ class TUIController:
             exit_code = 4
 
         # Update state
-        if last_stdout:
-            self.state.last_output = last_stdout
+        if stdout_lines:
+            self.state.last_output = "\n".join(stdout_lines)
 
         self.state.recent_runs.append(RecentRun(command=command, exit_code=exit_code))
         if len(self.state.recent_runs) > self.state.max_recent:
             self.state.recent_runs = self.state.recent_runs[-self.state.max_recent :]
+
+        # Emit plan-complete signal so the app can chain into a run
+        if exit_code == 0:
+            spec_path = _extract_plan_spec_path(command)
+            if spec_path is not None:
+                self.append_system(f"__PLAN_COMPLETE__{spec_path}")
 
         self.state.runner_status = RunnerStatus.IDLE
         self.state.current_command = ""
         self._run_task = None
         await self._notify()
 
+    # Batch notification state — reduces render cycles for high-volume output.
+    # Instead of calling _notify() for every single stdout/stderr line
+    # (which triggers a full RichLog render cycle each time), we batch
+    # output events and only notify periodically.
+    _pending_events: int = 0
+    _last_notify_time: float = 0.0
+    _BATCH_SIZE: int = 40           # notify every N output events
+    _BATCH_INTERVAL: float = 0.15   # or every 150ms, whichever comes first
+
     async def _reduce_runner_event(self, event: RunnerEvent) -> None:
-        """Reduce a single runner event into transcript state."""
+        """Reduce a single runner event into transcript state.
+
+        Batches stdout/stderr events to avoid overwhelming Textual's
+        render loop.  Important events (FINISHED, CANCEL, ERROR) always
+        notify immediately.
+        """
         if event.kind == RunnerEventKind.STDOUT_LINE:
             self._append_event(
                 TranscriptEvent(kind=EventKind.STDOUT, text=event.text)
@@ -411,19 +466,36 @@ class TUIController:
                     exit_code=event.exit_code,
                 )
             )
+            # Always flush + notify immediately for important events
+            self._pending_events = 0
+            await self._notify()
+            return
         elif event.kind == RunnerEventKind.CANCEL_ACK:
             self._append_event(
                 TranscriptEvent(kind=EventKind.SYSTEM, text="Command cancelled.")
             )
             self.state.runner_status = RunnerStatus.CANCELLED
+            self._pending_events = 0
+            await self._notify()
+            return
         elif event.kind == RunnerEventKind.ERROR:
             self._append_event(
                 TranscriptEvent(kind=EventKind.STDERR, text=event.text)
             )
+            self._pending_events = 0
+            await self._notify()
+            return
 
-        await self._notify()
-        # Yield to the event loop so Textual can render between events
-        await asyncio.sleep(0)
+        # Batch stdout/stderr: only notify every _BATCH_SIZE events or _BATCH_INTERVAL
+        self._pending_events += 1
+        now = time.monotonic()
+        elapsed = now - self._last_notify_time
+        if self._pending_events >= self._BATCH_SIZE or elapsed >= self._BATCH_INTERVAL:
+            self._pending_events = 0
+            self._last_notify_time = now
+            await self._notify()
+            # Yield to the event loop so Textual can process key events
+            await asyncio.sleep(0)
 
 
 # ---------------------------------------------------------------------------
@@ -483,12 +555,12 @@ def _detect_workspace_sync() -> dict[str, object]:
 
 def _try_clipboard_copy(text: str) -> bool:
     """Best-effort copy *text* to the system clipboard. Returns True on success."""
-    # Try in order: pbcopy (macOS), wl-copy (Wayland), xclip, xsel
     candidates: list[list[str]] = [
-        ["pbcopy"],
-        ["wl-copy"],
-        ["xclip", "-selection", "clipboard"],
-        ["xsel", "--clipboard", "--input"],
+        ["pbcopy"],                                # macOS
+        ["clip.exe"],                              # WSL2 (Windows clipboard)
+        ["wl-copy"],                               # Wayland
+        ["xclip", "-selection", "clipboard"],      # X11
+        ["xsel", "--clipboard", "--input"],        # X11 fallback
     ]
     for cmd in candidates:
         if shutil.which(cmd[0]) is None:
@@ -508,6 +580,18 @@ def _try_clipboard_copy(text: str) -> bool:
     return False
 
 
+def _extract_plan_spec_path(command: str) -> str | None:
+    """Extract the spec path from a plan command string, or None if not a plan."""
+    parts = command.split()
+    if not parts or parts[0] != "plan":
+        return None
+    for part in parts[1:]:
+        if not part.startswith("-"):
+            return part
+    return None
+
+
 __all__ = [
     "TUIController",
+    "_extract_plan_spec_path",
 ]

@@ -86,7 +86,7 @@ def star_sep() -> str:
 # (id, icon_key, label_text, command, needs_args)
 _QUICK_ACTION_DEFS: list[tuple[str, str, str, str, bool]] = [
     ("qa-plan",    "play",    "Plan\u2026",   "/run plan",      True),
-    ("qa-run",     "play",    "Run --mock",   "/run run --mock", False),
+    ("qa-progress", "play",   "Progress\u2026", "/progress",      True),
     ("qa-status",  "info",    "Status",       "/run status",    False),
     ("qa-inspect", "search",  "Inspect",      "/run inspect",   False),
     ("qa-export",  "package", "Export",        "/run export",    False),

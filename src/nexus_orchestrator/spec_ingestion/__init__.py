@@ -18,7 +18,7 @@ Non-functional requirements
 - Must be deterministic; same input yields same SpecMap (modulo timestamps).
 """
 
-from nexus_orchestrator.spec_ingestion.ingestor import SpecIngestError, ingest_spec
+from nexus_orchestrator.spec_ingestion.ingestor import ExtractionInfo, SpecIngestError, ingest_spec
 from nexus_orchestrator.spec_ingestion.spec_map import (
     Entity,
     EntityDiff,
@@ -38,6 +38,7 @@ from nexus_orchestrator.spec_ingestion.spec_map import (
 __all__ = [
     "Entity",
     "EntityDiff",
+    "ExtractionInfo",
     "InterfaceContract",
     "InterfaceDiff",
     "Requirement",
