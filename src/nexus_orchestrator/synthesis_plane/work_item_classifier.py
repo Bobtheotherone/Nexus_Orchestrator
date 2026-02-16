@@ -25,8 +25,8 @@ class ModelAffinity(enum.Enum):
     """Which model should be primary for a work item.
 
     Three-way routing:
-    - GPT53: complex reasoning, architecture, multi-step planning (codex --model gpt-5.3)
-    - SPARK: quick/simple tasks, small fixes, docs (codex --model gpt-5.3-spark)
+    - GPT53: complex reasoning, architecture, multi-step planning (codex -m gpt-5.3-codex)
+    - SPARK: quick/simple tasks, small fixes, docs (codex -m gpt-5.3-codex-spark)
     - OPUS: deep coding, large refactors, tests (claude --model claude-opus-4-6)
     """
 

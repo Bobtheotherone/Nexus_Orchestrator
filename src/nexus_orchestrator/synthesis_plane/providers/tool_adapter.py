@@ -68,8 +68,8 @@ _STDIN_THRESHOLD: Final[int] = 100_000
 # Maps catalog model name → (ToolBackend, CLI --model flag value)
 # Empty string means no --model flag (legacy default behaviour)
 TOOL_MODEL_SPEC: Final[dict[str, tuple[ToolBackend, str]]] = {
-    "codex_gpt53": (ToolBackend.CODEX_CLI, "gpt-5.3"),
-    "codex_spark": (ToolBackend.CODEX_CLI, "gpt-5.3-spark"),
+    "codex_gpt53": (ToolBackend.CODEX_CLI, "gpt-5.3-codex"),
+    "codex_spark": (ToolBackend.CODEX_CLI, "gpt-5.3-codex-spark"),
     "claude_opus": (ToolBackend.CLAUDE_CODE, "claude-opus-4-6"),
     "codex_cli": (ToolBackend.CODEX_CLI, ""),
     "claude_code": (ToolBackend.CLAUDE_CODE, ""),
@@ -243,7 +243,7 @@ class ToolProvider(BaseProvider):
         if self._backend == ToolBackend.CODEX_CLI:
             cmd = [self._binary_path, "exec", "--full-auto"]
             if self._model_flag:
-                cmd.extend(["--model", self._model_flag])
+                cmd.extend(["-m", self._model_flag])
             cmd.append(prompt_text)
             return cmd
         # Claude Code: print mode with streaming JSON for live progress
@@ -257,7 +257,7 @@ class ToolProvider(BaseProvider):
         if self._backend == ToolBackend.CODEX_CLI:
             cmd = [self._binary_path, "exec", "--full-auto"]
             if self._model_flag:
-                cmd.extend(["--model", self._model_flag])
+                cmd.extend(["-m", self._model_flag])
             cmd.append("-")
             return cmd
         cmd = [self._binary_path, "-p", "-", "--verbose", "--output-format", "stream-json"]

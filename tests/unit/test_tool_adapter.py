@@ -464,19 +464,19 @@ class TestWorkspaceIsolation:
 
 
 class TestModelFlag:
-    """Tests for --model flag in CLI commands."""
+    """Tests for model flag in CLI commands (-m for codex, --model for claude)."""
 
     def test_codex_command_with_model_flag(self) -> None:
         provider = ToolProvider(
             backend=ToolBackend.CODEX_CLI,
             binary_path="/usr/bin/codex",
-            model_flag="gpt-5.3",
+            model_flag="gpt-5.3-codex",
         )
         cmd = provider._build_command("hello")
-        assert "--model" in cmd
-        assert "gpt-5.3" in cmd
-        idx = cmd.index("--model")
-        assert cmd[idx + 1] == "gpt-5.3"
+        assert "-m" in cmd
+        assert "gpt-5.3-codex" in cmd
+        idx = cmd.index("-m")
+        assert cmd[idx + 1] == "gpt-5.3-codex"
 
     def test_claude_command_with_model_flag(self) -> None:
         provider = ToolProvider(
@@ -494,7 +494,7 @@ class TestModelFlag:
             binary_path="/usr/bin/codex",
         )
         cmd = provider._build_command("hello")
-        assert "--model" not in cmd
+        assert "-m" not in cmd
 
     def test_claude_command_without_model_flag(self) -> None:
         provider = ToolProvider(
@@ -508,11 +508,11 @@ class TestModelFlag:
         provider = ToolProvider(
             backend=ToolBackend.CODEX_CLI,
             binary_path="/usr/bin/codex",
-            model_flag="gpt-5.3-spark",
+            model_flag="gpt-5.3-codex-spark",
         )
         cmd = provider._build_command_stdin()
-        assert "--model" in cmd
-        assert "gpt-5.3-spark" in cmd
+        assert "-m" in cmd
+        assert "gpt-5.3-codex-spark" in cmd
         # "-" should be last (stdin marker)
         assert cmd[-1] == "-"
 
@@ -525,8 +525,8 @@ class TestModelFlag:
         assert "claude_code" in TOOL_MODEL_SPEC
 
         # New models have non-empty flags
-        assert TOOL_MODEL_SPEC["codex_gpt53"][1] == "gpt-5.3"
-        assert TOOL_MODEL_SPEC["codex_spark"][1] == "gpt-5.3-spark"
+        assert TOOL_MODEL_SPEC["codex_gpt53"][1] == "gpt-5.3-codex"
+        assert TOOL_MODEL_SPEC["codex_spark"][1] == "gpt-5.3-codex-spark"
         assert TOOL_MODEL_SPEC["claude_opus"][1] == "claude-opus-4-6"
 
         # Legacy models have empty flags

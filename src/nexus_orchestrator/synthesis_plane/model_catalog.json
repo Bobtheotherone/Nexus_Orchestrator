@@ -176,7 +176,7 @@
     {
       "provider": "tool",
       "model": "codex_gpt53",
-      "aliases": ["codex-gpt-5.3"],
+      "aliases": ["codex-gpt-5.3", "gpt-5.3-codex"],
       "max_context_tokens": 200000,
       "supports_tool_calling": false,
       "supports_structured_outputs": false,
@@ -187,12 +187,12 @@
         "blended_per_1k_usd": 0.0
       },
       "availability": "ga",
-      "notes": "GPT 5.3 via Codex CLI — complex reasoning and architecture tasks."
+      "notes": "GPT-5.3-Codex via Codex CLI (-m gpt-5.3-codex) — complex reasoning and architecture tasks."
     },
     {
       "provider": "tool",
       "model": "codex_spark",
-      "aliases": ["codex-spark", "gpt-5.3-spark-codex"],
+      "aliases": ["codex-spark", "gpt-5.3-codex-spark"],
       "max_context_tokens": 200000,
       "supports_tool_calling": false,
       "supports_structured_outputs": false,
@@ -203,7 +203,7 @@
         "blended_per_1k_usd": 0.0
       },
       "availability": "ga",
-      "notes": "GPT 5.3 Spark via Codex CLI — fast tasks and triage routing."
+      "notes": "GPT-5.3-Codex-Spark via Codex CLI (-m gpt-5.3-codex-spark) — fast tasks and triage routing."
     },
     {
       "provider": "tool",

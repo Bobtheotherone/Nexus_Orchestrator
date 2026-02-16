@@ -80,7 +80,7 @@ async def triage_with_spark(
     *,
     codex_binary_path: str | None = None,
     timeout_seconds: float = _DEFAULT_TRIAGE_TIMEOUT,
-    model_flag: str = "gpt-5.3-spark",
+    model_flag: str = "gpt-5.3-codex-spark",
 ) -> TriageResult:
     """Call Spark to classify the work item. Falls back to deterministic on failure.
 
@@ -107,10 +107,10 @@ async def triage_with_spark(
         constraint_count=len(work_item.constraint_envelope.constraints),
     )
 
-    # Build command: codex exec --full-auto --model gpt-5.3-spark "prompt"
+    # Build command: codex exec --full-auto -m gpt-5.3-codex-spark "prompt"
     cmd = [binary, "exec", "--full-auto"]
     if model_flag:
-        cmd.extend(["--model", model_flag])
+        cmd.extend(["-m", model_flag])
     cmd.append(prompt)
 
     try:
