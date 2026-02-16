@@ -991,6 +991,26 @@ def build_deterministic_architect_output(spec_map: SpecMap) -> ArchitectOutput:
                 interface_contract_refs=tail_module.interface_contract_refs,
                 interface_guarantees=tail_module.interface_guarantees,
             )
+    elif spec_map.requirements:
+        # No interfaces found — generate work items directly from requirements.
+        # This supports freeform design documents that have requirements but
+        # no explicit interface/module definitions.
+        for requirement in spec_map.requirements:
+            stem = _module_to_path_stem(requirement.id)
+            work_items.append(
+                WorkItemProposal(
+                    id=requirement.id,
+                    title=requirement.statement[:80],
+                    description=requirement.statement,
+                    owned_paths=(f"src/{stem}.py",),
+                    dependencies=(),
+                    requirement_links=(requirement.id,),
+                    module=None,
+                    interface_contract_refs=(),
+                    interface_guarantees=(),
+                    constraint_ids=(),
+                )
+            )
 
     return ArchitectOutput(
         modules=tuple(modules),

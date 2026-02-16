@@ -4,13 +4,15 @@ from __future__ import annotations
 
 import asyncio
 import re
+import threading
 import warnings
 from collections import defaultdict
 from collections.abc import Mapping, Sequence
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from threading import RLock
+from threading import RLock, Semaphore
 from typing import Final, TypeAlias, cast
 
 from nexus_orchestrator.config.schema import assert_valid_config, default_config, merge_config
@@ -64,6 +66,11 @@ from nexus_orchestrator.synthesis_plane.roles import (
     ROLE_IMPLEMENTER,
     EscalationDecision,
     RoleRegistry,
+    resolve_tool_ladder_for_affinity,
+)
+from nexus_orchestrator.synthesis_plane.work_item_classifier import (
+    ModelAffinity,
+    classify_work_item,
 )
 from nexus_orchestrator.utils.hashing import sha256_text
 from nexus_orchestrator.verification_plane import (
@@ -180,6 +187,62 @@ class _DeterministicMockProvider:
         )
 
 
+# --- Per-thread event loop management ---
+# Avoids "Event loop is closed" errors caused by asyncio.run() creating
+# and destroying a loop per call.  Subprocess transports are GC'd after
+# the loop closes, triggering RuntimeError.  Reusing a single loop per
+# thread prevents this.
+_thread_loop: threading.local = threading.local()
+
+
+def _run_async(coro: object) -> object:
+    """Run an async coroutine using a per-thread reusable event loop.
+
+    Unlike ``asyncio.run()`` this keeps the loop alive across calls in
+    the same thread, preventing "Event loop is closed" errors from
+    subprocess transport GC.
+    """
+    loop: asyncio.AbstractEventLoop | None = getattr(_thread_loop, "loop", None)
+    if loop is None or loop.is_closed():
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        _thread_loop.loop = loop
+    return loop.run_until_complete(coro)  # type: ignore[arg-type]
+
+
+def _suppress_event_loop_gc_errors() -> None:
+    """Silence subprocess transport GC errors from worker threads.
+
+    When subprocess transports are garbage-collected after the event loop
+    closes (common in thread pools), Python emits RuntimeError via
+    sys.unraisablehook.  These are cosmetic — suppress them globally.
+    """
+    import atexit
+    import sys
+
+    _original_hook = sys.unraisablehook
+
+    def _quiet_hook(unraisable: sys.UnraisableHookArgs) -> None:
+        if (
+            isinstance(unraisable.exc_value, RuntimeError)
+            and "Event loop is closed" in str(unraisable.exc_value)
+        ):
+            return  # suppress
+        _original_hook(unraisable)
+
+    sys.unraisablehook = _quiet_hook
+
+    def _cleanup() -> None:
+        loop = getattr(_thread_loop, "loop", None)
+        if loop is not None and not loop.is_closed():
+            loop.close()
+
+    atexit.register(_cleanup)
+
+
+_suppress_event_loop_gc_errors()
+
+
 class OrchestratorController:
     """Controller coordinating ingest -> plan -> dispatch -> verify -> merge."""
 
@@ -216,9 +279,24 @@ class OrchestratorController:
         self._crash_after_attempts = crash_after_attempts
         self._attempts_processed = 0
 
+        # Per-backend concurrency limits.
+        # Claude CLI cannot handle many concurrent instances (auth/session conflicts).
+        # Codex CLI handles concurrency well.
+        self._claude_semaphore = Semaphore(2)
+        self._codex_semaphore = Semaphore(6)
+
+        # Round-robin distribution state: prevents all items routing to one model
+        self._rr_counter: int = 0
+        self._rr_last_affinity: ModelAffinity | None = None
+        self._rr_consecutive: int = 0
+
     @property
     def state_db_path(self) -> Path:
         return self._state_db.path
+
+    def _log(self, message: str) -> None:
+        """Print progress message to stdout for TUI display."""
+        print(f"[nexus] {message}", flush=True)
 
     def pause(self, run_id: str) -> Run | None:
         with self._lock:
@@ -285,6 +363,7 @@ class OrchestratorController:
         )
 
         resolved_spec = self._resolve_spec_path(spec_path)
+        self._log(f"Spec: {resolved_spec.relative_path}")
         normalized_mode = mode.strip().lower()
         run_record, resumed = self._load_or_create_run(
             spec_relative=resolved_spec.relative_path,
@@ -296,8 +375,10 @@ class OrchestratorController:
         warning_messages.extend(
             self._warn_on_run_metadata(run_record.id, warning_messages=tuple(warning_messages))
         )
+        self._log(f"Run {run_record.id[:12]}{'  (resumed)' if resumed else ''}")
 
         if not resumed or not self._work_item_repo.list_for_run(run_record.id, limit=1):
+            self._log("Planning...")
             compilation = self._plan_run(
                 run_record=run_record,
                 spec_absolute=resolved_spec.absolute_path,
@@ -305,6 +386,7 @@ class OrchestratorController:
             )
             warning_messages.extend(compilation.warnings)
             if compilation.task_graph is None or compilation.errors:
+                self._log(f"Planning FAILED: {len(compilation.errors)} errors")
                 self._record_incident(
                     run_id=run_record.id,
                     category="planning",
@@ -320,6 +402,7 @@ class OrchestratorController:
                     resumed=resumed,
                     warnings=tuple(sorted(set(warning_messages))),
                 )
+            self._log(f"Planning complete: {len(compilation.work_items)} work items")
 
         self._recover_inflight_work_items(run_record.id, merge_queue)
         latest_run = self._require_run(run_record.id)
@@ -327,6 +410,15 @@ class OrchestratorController:
             latest_run.status is RunStatus.PAUSED and normalized_mode in {"resume", "auto"}
         ):
             latest_run = self._run_repo.set_status(run_record.id, RunStatus.RUNNING)
+
+        initial_items = self._work_item_repo.list_for_run(run_record.id, limit=1_000)
+        total_items = len(initial_items)
+        already_done = sum(
+            1 for item in initial_items
+            if item.status in {WorkItemStatus.MERGED, WorkItemStatus.FAILED}
+        )
+        items_processed = already_done
+        self._log(f"{total_items} work items ({already_done} already completed)")
 
         try:
             while True:
@@ -375,6 +467,7 @@ class OrchestratorController:
                     )
 
                 if all(item.status is WorkItemStatus.MERGED for item in work_items):
+                    self._log("All work items merged — run complete")
                     self._run_repo.set_status(current_run.id, RunStatus.COMPLETED)
                     return self._build_result(
                         run_id=current_run.id,
@@ -401,6 +494,7 @@ class OrchestratorController:
                         if item.status not in {WorkItemStatus.MERGED, WorkItemStatus.FAILED}
                     ]
                     if unresolved:
+                        self._log("Run deadlocked — no runnable work items remain")
                         self._run_repo.set_status(current_run.id, RunStatus.FAILED)
                         self._record_incident(
                             run_id=current_run.id,
@@ -408,8 +502,13 @@ class OrchestratorController:
                             message="run is deadlocked; no runnable work items remain",
                         )
                     elif any(item.status is WorkItemStatus.FAILED for item in work_items):
+                        failed_count = sum(
+                            1 for item in work_items if item.status is WorkItemStatus.FAILED
+                        )
+                        self._log(f"Run finished with {failed_count} failed work items")
                         self._run_repo.set_status(current_run.id, RunStatus.FAILED)
                     else:
+                        self._log("Run complete")
                         self._run_repo.set_status(current_run.id, RunStatus.COMPLETED)
                     return self._build_result(
                         run_id=current_run.id,
@@ -419,29 +518,72 @@ class OrchestratorController:
 
                 batch_ids = tuple(item.id for item in runnable)
                 self._append_dispatch_batch(current_run.id, batch_ids)
-                for work_item in runnable:
-                    self._process_work_item(
-                        run_id=current_run.id,
-                        work_item=work_item,
-                        effective_config=effective_config,
-                        role_registry=role_registry,
-                        model_catalog=model_catalog,
-                        warned_models=warned_models,
-                        warning_messages=warning_messages,
-                        mock=mock,
-                        git_engine=git_engine,
-                        workspace_manager=workspace_manager,
-                        merge_queue=merge_queue,
-                        evidence_root=evidence_root,
-                    )
 
-                    if (
-                        self._crash_after_attempts is not None
-                        and self._attempts_processed >= self._crash_after_attempts
-                    ):
-                        raise SimulatedCrashError(
-                            f"simulated crash after {self._attempts_processed} processed attempt(s)"
+                # --- Parallel dispatch ---
+                # Dispatch all work items in the batch concurrently.
+                # Each thread gets its own asyncio event loop (via asyncio.run).
+                max_workers = min(len(runnable), self._parallel_workers(effective_config))
+                self._log(f"Dispatching batch of {len(runnable)} (workers={max_workers})")
+
+                if max_workers <= 1:
+                    # Sequential fallback (mock mode or single item)
+                    for work_item in runnable:
+                        items_processed += 1
+                        self._log(f"[{items_processed}/{total_items}] {work_item.title}")
+                        self._process_work_item(
+                            run_id=current_run.id,
+                            work_item=work_item,
+                            effective_config=effective_config,
+                            role_registry=role_registry,
+                            model_catalog=model_catalog,
+                            warned_models=warned_models,
+                            warning_messages=warning_messages,
+                            mock=mock,
+                            git_engine=git_engine,
+                            workspace_manager=workspace_manager,
+                            merge_queue=merge_queue,
+                            evidence_root=evidence_root,
                         )
+                else:
+                    # Concurrent dispatch via thread pool
+                    futures: dict[object, WorkItem] = {}
+                    with ThreadPoolExecutor(
+                        max_workers=max_workers,
+                        thread_name_prefix="nexus-dispatch",
+                    ) as pool:
+                        for work_item in runnable:
+                            items_processed += 1
+                            self._log(f"[{items_processed}/{total_items}] {work_item.title}")
+                            future = pool.submit(
+                                self._process_work_item,
+                                run_id=current_run.id,
+                                work_item=work_item,
+                                effective_config=effective_config,
+                                role_registry=role_registry,
+                                model_catalog=model_catalog,
+                                warned_models=warned_models,
+                                warning_messages=warning_messages,
+                                mock=mock,
+                                git_engine=git_engine,
+                                workspace_manager=workspace_manager,
+                                merge_queue=merge_queue,
+                                evidence_root=evidence_root,
+                            )
+                            futures[future] = work_item
+                        for future in as_completed(futures):
+                            try:
+                                future.result()
+                            except Exception as exc:  # noqa: BLE001
+                                wi = futures[future]
+                                self._log(f"  Worker error [{wi.id}]: {exc}")
+
+                if (
+                    self._crash_after_attempts is not None
+                    and self._attempts_processed >= self._crash_after_attempts
+                ):
+                    raise SimulatedCrashError(
+                        f"simulated crash after {self._attempts_processed} processed attempt(s)"
+                    )
 
                 self._drain_merge_queue(
                     run_id=current_run.id,
@@ -451,7 +593,22 @@ class OrchestratorController:
                 )
         except SimulatedCrashError:
             raise
+        except KeyboardInterrupt:
+            self._log("Run interrupted by user (Ctrl+C)")
+            self._record_incident(
+                run_id=run_record.id,
+                category="controller",
+                message="run interrupted by user",
+            )
+            self._run_repo.set_status(run_record.id, RunStatus.CANCELLED)
+            warning_messages.append("run interrupted by user")
+            return self._build_result(
+                run_id=run_record.id,
+                resumed=resumed,
+                warnings=tuple(sorted(set(warning_messages))),
+            )
         except Exception as exc:  # noqa: BLE001
+            self._log(f"Run crashed: {exc}")
             self._record_incident(
                 run_id=run_record.id,
                 category="controller",
@@ -582,23 +739,79 @@ class OrchestratorController:
         dispatch_plan = self._build_dispatch_plan(
             run_id=run_id,
             work_item=work_item,
+            effective_config=effective_config,
             role_registry=role_registry,
             model_catalog=model_catalog,
             warned_models=warned_models,
             warning_messages=warning_messages,
         )
         if dispatch_plan is None:
+            self._log("  No routing decision available — skipping")
             self._work_item_repo.set_status(work_item.id, WorkItemStatus.FAILED, run_id=run_id)
             return
 
+        # ── Workspace isolation ──────────────────────────────────────
+        # For real (non-mock) dispatch, create the isolated git worktree
+        # BEFORE dispatching the agent so the subprocess runs inside it.
+        # This prevents agents from ever seeing or modifying the
+        # orchestrator repository.
+        pre_attempt_id = ids.generate_attempt_id()
+        workspace: Workspace | None = None
+        workspace_cwd: Path | None = None
+
+        if not mock:
+            try:
+                workspace = workspace_manager.create_workspace(
+                    work_item.id,
+                    pre_attempt_id,
+                    work_item.scope,
+                    base_branch=git_engine.integration_branch,
+                )
+                workspace_cwd = workspace.paths.workspace_dir
+            except Exception as exc:  # noqa: BLE001
+                self._record_incident(
+                    run_id=run_id,
+                    category="workspace",
+                    message=f"failed to create workspace: {exc}",
+                    related_work_item_id=work_item.id,
+                )
+                self._work_item_repo.set_status(
+                    work_item.id, WorkItemStatus.FAILED, run_id=run_id,
+                )
+                return
+            self._workspace_by_branch[workspace.branch_name] = workspace
+
+            # Rebuild the prompt with workspace context so the agent
+            # knows it is running inside an isolated worktree.
+            augmented_prompt = self._build_prompt(
+                work_item,
+                dispatch_plan.decision,
+                dispatch_plan.attempt_number,
+                workspace_dir=workspace_cwd,
+            )
+            dispatch_plan = _DispatchPlan(
+                work_item=dispatch_plan.work_item,
+                decision=dispatch_plan.decision,
+                attempt_number=dispatch_plan.attempt_number,
+                prompt=augmented_prompt,
+                dispatch_budget=dispatch_plan.dispatch_budget,
+            )
+
+        _dispatch_tag_map = {
+            "codex_gpt53": "gpt53", "codex_spark": "spark", "claude_opus": "opus",
+        }
+        _dtag = _dispatch_tag_map.get(dispatch_plan.decision.model, dispatch_plan.decision.model)
+        self._log(f"  [{_dtag}] Dispatching via {dispatch_plan.decision.model}...")
         dispatch_outcome = self._dispatch_one(
             run_id=run_id,
             dispatch_plan=dispatch_plan,
             effective_config=effective_config,
             mock=mock,
             model_catalog=model_catalog,
+            workspace_cwd=workspace_cwd,
         )
         if dispatch_outcome.error is not None or dispatch_outcome.result is None:
+            self._log(f"  Dispatch FAILED: {dispatch_outcome.error or 'unknown'}")
             self._record_incident(
                 run_id=run_id,
                 category="dispatch",
@@ -606,8 +819,14 @@ class OrchestratorController:
                 related_work_item_id=work_item.id,
             )
             self._work_item_repo.set_status(work_item.id, WorkItemStatus.FAILED, run_id=run_id)
+            if workspace is not None:
+                self._cleanup_workspace_for_branch(workspace.branch_name, workspace_manager)
             return
 
+        self._log(
+            f"  Dispatch OK ({dispatch_outcome.dispatch_result_tokens} tokens, "
+            f"${dispatch_outcome.dispatch_result_cost_usd:.4f})"
+        )
         self._update_budget_usage(
             run_id=run_id,
             tokens=dispatch_outcome.dispatch_result_tokens,
@@ -616,7 +835,12 @@ class OrchestratorController:
         )
         self._attempts_processed += 1
 
-        attempt_id = dispatch_outcome.dispatch_result_attempt_id
+        # Use our pre-generated attempt_id for workspace naming (real mode)
+        # or the dispatch-generated one for mock mode.
+        attempt_id = pre_attempt_id
+        if mock:
+            attempt_id = dispatch_outcome.dispatch_result_attempt_id or pre_attempt_id
+
         if attempt_id is None:
             self._record_incident(
                 run_id=run_id,
@@ -625,38 +849,51 @@ class OrchestratorController:
                 related_work_item_id=work_item.id,
             )
             self._work_item_repo.set_status(work_item.id, WorkItemStatus.FAILED, run_id=run_id)
+            if workspace is not None:
+                self._cleanup_workspace_for_branch(workspace.branch_name, workspace_manager)
             return
 
-        workspace: Workspace
-        try:
-            workspace = workspace_manager.create_workspace(
-                work_item.id,
-                attempt_id,
-                work_item.scope,
-                base_branch=git_engine.integration_branch,
-            )
-        except Exception as exc:  # noqa: BLE001
-            self._record_incident(
-                run_id=run_id,
-                category="workspace",
-                message=f"failed to create workspace: {exc}",
-                related_work_item_id=work_item.id,
-            )
-            self._work_item_repo.set_status(work_item.id, WorkItemStatus.FAILED, run_id=run_id)
-            return
-        self._workspace_by_branch[workspace.branch_name] = workspace
+        # ── Mock mode: create workspace AFTER dispatch (existing flow) ──
+        if mock and workspace is None:
+            try:
+                workspace = workspace_manager.create_workspace(
+                    work_item.id,
+                    attempt_id,
+                    work_item.scope,
+                    base_branch=git_engine.integration_branch,
+                )
+            except Exception as exc:  # noqa: BLE001
+                self._record_incident(
+                    run_id=run_id,
+                    category="workspace",
+                    message=f"failed to create workspace: {exc}",
+                    related_work_item_id=work_item.id,
+                )
+                self._work_item_repo.set_status(
+                    work_item.id, WorkItemStatus.FAILED, run_id=run_id,
+                )
+                return
+            self._workspace_by_branch[workspace.branch_name] = workspace
+
+        assert workspace is not None  # noqa: S101
 
         try:
             if mock:
+                # Mock mode: apply the returned patch to the workspace
                 self._seed_missing_mock_scope_files(
                     workspace_dir=workspace.paths.workspace_dir,
                     scope=work_item.scope,
                 )
-            git_engine.apply_patch(workspace.paths.workspace_dir, dispatch_outcome.result.raw_text)
+                git_engine.apply_patch(
+                    workspace.paths.workspace_dir, dispatch_outcome.result.raw_text,
+                )
+            # else: real mode — agent already modified files directly in the
+            # workspace worktree; nothing to apply.
+
             try:
                 git_engine.commit(
                     workspace.paths.workspace_dir,
-                    f"{work_item.title} (mock)",
+                    f"{work_item.title} ({'mock' if mock else 'nexus'})",
                     work_item=work_item.id,
                     evidence="pending",
                     agent=ROLE_IMPLEMENTER,
@@ -666,6 +903,7 @@ class OrchestratorController:
                 if "No staged changes to commit after filtering internal files." not in str(exc):
                     raise
         except Exception as exc:  # noqa: BLE001
+            self._log(f"  Patch apply FAILED: {exc}")
             self._record_incident(
                 run_id=run_id,
                 category="patch_apply",
@@ -677,6 +915,7 @@ class OrchestratorController:
             return
 
         self._work_item_repo.set_status(work_item.id, WorkItemStatus.VERIFYING, run_id=run_id)
+        self._log("  Verifying...")
         gate_decision, evidence_ids = self._verify_and_record(
             run_id=run_id,
             work_item=work_item,
@@ -686,6 +925,7 @@ class OrchestratorController:
             attempt_id=attempt_id,
         )
         if not gate_decision.accepted:
+            self._log(f"  Verification FAILED: {', '.join(gate_decision.reason_codes)}")
             self._record_incident(
                 run_id=run_id,
                 category="constraint_gate",
@@ -700,6 +940,7 @@ class OrchestratorController:
             self._cleanup_workspace_for_branch(workspace.branch_name, workspace_manager)
             return
 
+        self._log("  Verification passed")
         self._work_item_repo.set_status(work_item.id, WorkItemStatus.PASSED, run_id=run_id)
         candidate = QueueCandidate(
             branch=workspace.branch_name,
@@ -710,7 +951,9 @@ class OrchestratorController:
         )
         try:
             merge_queue.enqueue(candidate)
+            self._log("  Queued for merge")
         except Exception as exc:  # noqa: BLE001
+            self._log(f"  Merge queue FAILED: {exc}")
             self._record_incident(
                 run_id=run_id,
                 category="merge_queue",
@@ -728,26 +971,135 @@ class OrchestratorController:
         effective_config: Mapping[str, object],
         mock: bool,
         model_catalog: ModelCatalog,
+        workspace_cwd: Path | None = None,
     ) -> _DispatchOutcome:
-        patch_by_work_item = {
-            dispatch_plan.work_item.id: self._mock_patch_for_work_item(dispatch_plan.work_item),
-        }
+        model_name = dispatch_plan.decision.model
         if mock:
+            patch_by_work_item = {
+                dispatch_plan.work_item.id: self._mock_patch_for_work_item(dispatch_plan.work_item),
+            }
             provider = _DeterministicMockProvider(
                 provider_name=dispatch_plan.decision.provider,
                 model_catalog=model_catalog,
                 patch_by_work_item=patch_by_work_item,
             )
         else:
-            return _DispatchOutcome(
-                plan=dispatch_plan,
-                result=None,
-                dispatch_result_attempt_id=None,
-                dispatch_result_attempts=0,
-                dispatch_result_tokens=0,
-                dispatch_result_cost_usd=0.0,
-                error="non-mock providers are not configured in this controller implementation",
+            # Real mode: use detected CLI tool backends (codex / claude)
+            from nexus_orchestrator.synthesis_plane.providers.tool_adapter import (
+                TOOL_MODEL_SPEC,
+                ToolBackend,
+                ToolProvider,
             )
+            from nexus_orchestrator.synthesis_plane.providers.tool_detection import detect_all_backends
+
+            backends = detect_all_backends()
+            if not backends:
+                return _DispatchOutcome(
+                    plan=dispatch_plan,
+                    result=None,
+                    dispatch_result_attempt_id=None,
+                    dispatch_result_attempts=0,
+                    dispatch_result_tokens=0,
+                    dispatch_result_cost_usd=0.0,
+                    error="no CLI tool backends available (install codex or claude CLI)",
+                )
+
+            _name_to_enum = {"codex": ToolBackend.CODEX_CLI, "claude": ToolBackend.CLAUDE_CODE}
+
+            # Pick backend matching the escalation model when possible
+            _model_to_backend = {
+                "codex_cli": "codex",
+                "claude_code": "claude",
+                "codex_gpt53": "codex",
+                "codex_spark": "codex",
+                "claude_opus": "claude",
+            }
+            # Cross-backend fallback: when the preferred backend (e.g. claude)
+            # is not installed, remap to the best equivalent on the available
+            # backend so we don't pass an incompatible --model flag.
+            _CROSS_BACKEND_FALLBACK: dict[str, str] = {
+                # claude model → best codex equivalent
+                "claude_opus": "codex_gpt53",
+                "claude_code": "codex_cli",
+                # codex model → best claude equivalent
+                "codex_gpt53": "claude_opus",
+                "codex_spark": "claude_code",
+                "codex_cli": "claude_code",
+            }
+            available_backend_names = {bi.name for bi in backends}
+            preferred_name = _model_to_backend.get(model_name)
+            backend_info = backends[0]  # default: first detected
+            backend_matched = False
+            if preferred_name is not None:
+                for bi in backends:
+                    if bi.name == preferred_name:
+                        backend_info = bi
+                        backend_matched = True
+                        break
+
+            if not backend_matched and preferred_name is not None:
+                # Preferred backend not available — remap model
+                fallback_model = _CROSS_BACKEND_FALLBACK.get(model_name)
+                if fallback_model:
+                    _tag_map = {
+                        "codex_gpt53": "gpt53", "codex_spark": "spark",
+                        "claude_opus": "opus",
+                    }
+                    self._log(
+                        f"  [{_tag_map.get(model_name, model_name)}] "
+                        f"{preferred_name} CLI not installed, falling back to "
+                        f"{fallback_model}"
+                    )
+                    model_name = fallback_model
+                    preferred_name = _model_to_backend.get(model_name)
+                    for bi in backends:
+                        if bi.name == preferred_name:
+                            backend_info = bi
+                            break
+
+            backend_enum = _name_to_enum.get(backend_info.name)
+            if backend_enum is None:
+                return _DispatchOutcome(
+                    plan=dispatch_plan,
+                    result=None,
+                    dispatch_result_attempt_id=None,
+                    dispatch_result_attempts=0,
+                    dispatch_result_tokens=0,
+                    dispatch_result_cost_usd=0.0,
+                    error=f"unknown tool backend: {backend_info.name}",
+                )
+
+            # Resolve --model flag for the CLI tool
+            model_spec = TOOL_MODEL_SPEC.get(model_name)
+            model_flag = model_spec[1] if model_spec else ""
+
+            # Read timeout from config (default 600s)
+            tool_cfg = _nested_mapping_get(effective_config, ("providers", "tool"))
+            timeout_seconds = 600.0
+            if tool_cfg is not None:
+                timeout_raw = tool_cfg.get("timeout_seconds")
+                if isinstance(timeout_raw, (int, float)) and not isinstance(timeout_raw, bool):
+                    timeout_seconds = max(float(timeout_raw), 30.0)
+
+            try:
+                provider = ToolProvider(
+                    backend=backend_enum,
+                    binary_path=backend_info.binary_path,
+                    timeout_seconds=timeout_seconds,
+                    model_catalog=model_catalog,
+                    model_flag=model_flag,
+                    catalog_model=model_name,
+                )
+            except Exception as exc:  # noqa: BLE001
+                return _DispatchOutcome(
+                    plan=dispatch_plan,
+                    result=None,
+                    dispatch_result_attempt_id=None,
+                    dispatch_result_attempts=0,
+                    dispatch_result_tokens=0,
+                    dispatch_result_cost_usd=0.0,
+                    error=f"failed to initialize tool provider: {exc}",
+                )
 
         provider_cfg = _nested_mapping_get(
             effective_config,
@@ -788,15 +1140,39 @@ class OrchestratorController:
             prompt=dispatch_plan.prompt,
             provider_allowlist=(dispatch_plan.decision.provider,),
             budget=dispatch_plan.dispatch_budget,
+            workspace_dir=workspace_cwd,
             metadata={
                 "attempt_number": dispatch_plan.attempt_number,
                 "provider_name": dispatch_plan.decision.provider,
                 "model_name": dispatch_plan.decision.model,
                 "work_item_id": dispatch_plan.work_item.id,
+                "orchestrator_repo_root": str(self._repo_root),
             },
         )
+        # Acquire per-backend semaphore to limit concurrent CLI instances.
+        # Claude CLI cannot handle many concurrent sessions.
+        _backend_for_sem = {
+            "codex_gpt53": "codex", "codex_spark": "codex",
+            "claude_opus": "claude", "codex_cli": "codex", "claude_code": "claude",
+        }
+        sem_key = _backend_for_sem.get(model_name, "codex")
+        sem = self._claude_semaphore if sem_key == "claude" else self._codex_semaphore
         try:
-            dispatch_result = asyncio.run(controller.dispatch(request))
+            sem.acquire()
+            try:
+                dispatch_result = _run_async(controller.dispatch(request))
+            finally:
+                sem.release()
+        except KeyboardInterrupt:
+            return _DispatchOutcome(
+                plan=dispatch_plan,
+                result=None,
+                dispatch_result_attempt_id=None,
+                dispatch_result_attempts=0,
+                dispatch_result_tokens=0,
+                dispatch_result_cost_usd=0.0,
+                error="dispatch interrupted by user (Ctrl+C)",
+            )
         except Exception as exc:  # noqa: BLE001
             return _DispatchOutcome(
                 plan=dispatch_plan,
@@ -828,11 +1204,90 @@ class OrchestratorController:
             dispatch_result_cost_usd=dispatch_result.cost_usd,
         )
 
+    # Round-robin distribution order: OPUS gets 50%, GPT53 20%, SPARK 30%.
+    # Pattern repeats every 10 items: OPUS×5, SPARK×3, GPT53×2.
+    _RR_SEQUENCE: tuple[ModelAffinity, ...] = (
+        ModelAffinity.OPUS,
+        ModelAffinity.SPARK,
+        ModelAffinity.OPUS,
+        ModelAffinity.GPT53,
+        ModelAffinity.OPUS,
+        ModelAffinity.SPARK,
+        ModelAffinity.OPUS,
+        ModelAffinity.SPARK,
+        ModelAffinity.OPUS,
+        ModelAffinity.GPT53,
+    )
+
+    def _apply_round_robin(self, affinity: ModelAffinity) -> ModelAffinity:
+        """Force model distribution when triage keeps picking the same model.
+
+        If the triage/classifier returns the same model 3+ times consecutively,
+        override with a round-robin distribution to ensure all three models
+        get used.  This prevents homogeneous work item batches from
+        overloading a single model.
+        """
+        if affinity == self._rr_last_affinity:
+            self._rr_consecutive += 1
+        else:
+            self._rr_last_affinity = affinity
+            self._rr_consecutive = 1
+
+        if self._rr_consecutive >= 3:
+            # Force distribution
+            forced = self._RR_SEQUENCE[self._rr_counter % len(self._RR_SEQUENCE)]
+            self._rr_counter += 1
+            self._log(f"  Round-robin override: {affinity.value} → {forced.value}")
+            return forced
+
+        return affinity
+
+    def _triage_work_item(
+        self,
+        work_item: WorkItem,
+        effective_config: Mapping[str, object],
+    ) -> ModelAffinity:
+        """Route a work item via Spark LLM triage, falling back to deterministic."""
+        from nexus_orchestrator.synthesis_plane.spark_triage import triage_with_spark
+
+        # Check if triage is enabled (default: True)
+        tool_cfg = _nested_mapping_get(effective_config, ("providers", "tool"))
+        triage_enabled = True
+        triage_timeout = 30.0
+        if tool_cfg is not None:
+            te = tool_cfg.get("triage_enabled")
+            if isinstance(te, bool):
+                triage_enabled = te
+            tt = tool_cfg.get("triage_timeout_seconds")
+            if isinstance(tt, (int, float)) and not isinstance(tt, bool):
+                triage_timeout = max(float(tt), 5.0)
+
+        if not triage_enabled:
+            affinity = classify_work_item(work_item)
+            self._log(f"  Triage disabled → deterministic: {affinity.value}")
+            return affinity
+
+        try:
+            triage_result = _run_async(triage_with_spark(
+                work_item, timeout_seconds=triage_timeout,
+            ))
+        except Exception:  # noqa: BLE001
+            affinity = classify_work_item(work_item)
+            self._log(f"  Triage error → deterministic: {affinity.value}")
+            return affinity
+
+        if triage_result.used_llm:
+            self._log(f"  Spark triage → {triage_result.chosen_model.value}")
+        else:
+            self._log(f"  {triage_result.reasoning} → {triage_result.chosen_model.value}")
+        return triage_result.chosen_model
+
     def _build_dispatch_plan(
         self,
         *,
         run_id: str,
         work_item: WorkItem,
+        effective_config: Mapping[str, object],
         role_registry: RoleRegistry,
         model_catalog: ModelCatalog,
         warned_models: set[tuple[str, str]],
@@ -840,10 +1295,44 @@ class OrchestratorController:
     ) -> _DispatchPlan | None:
         previous_attempts = self._attempt_repo.list_for_work_item(work_item.id, limit=1_000)
         attempt_number = len(previous_attempts) + 1
-        decision = role_registry.route_attempt(
-            role_name=ROLE_IMPLEMENTER,
-            attempt_number=attempt_number,
-        )
+
+        # Intelligent model delegation: classify work item and pick the
+        # appropriate escalation ladder (codex-first vs claude-first)
+        decision: EscalationDecision | None = None
+        default_provider = "tool"
+        if isinstance(effective_config, Mapping):
+            providers_raw = effective_config.get("providers")
+            if isinstance(providers_raw, Mapping):
+                dp = providers_raw.get("default")
+                if isinstance(dp, str) and dp:
+                    default_provider = dp
+
+        if default_provider == "tool":
+            from nexus_orchestrator.synthesis_plane.roles import (
+                _resolve_provider_profile_models,
+            )
+
+            profile_models = _resolve_provider_profile_models(
+                config=effective_config, model_catalog=model_catalog,
+            )
+            if "tool" in profile_models:
+                # Try Spark LLM triage first, fall back to deterministic classifier
+                affinity = self._triage_work_item(work_item, effective_config)
+
+                # Round-robin: prevent all items routing to a single model.
+                # When triage picks the same model 3+ times in a row, force
+                # distribution across the three models.
+                affinity = self._apply_round_robin(affinity)
+
+                ladder = resolve_tool_ladder_for_affinity(affinity, profile_models)
+                decision = ladder.resolve_attempt(attempt_number)
+
+        # Fall back to role registry if classifier didn't produce a decision
+        if decision is None:
+            decision = role_registry.route_attempt(
+                role_name=ROLE_IMPLEMENTER,
+                attempt_number=attempt_number,
+            )
         if decision is None:
             self._record_incident(
                 run_id=run_id,
@@ -1051,6 +1540,7 @@ class OrchestratorController:
 
             candidate = merge_result.candidate
             if merge_result.status is MergeStatus.MERGED:
+                self._log(f"  Merged: {candidate.work_item_id[:12]}")
                 commit_sha = merge_result.integration_head_after
                 if commit_sha is None:
                     commit_sha = git_engine.get_integration_head()
@@ -1067,6 +1557,7 @@ class OrchestratorController:
                 continue
 
             if merge_result.status in {MergeStatus.FAILED, MergeStatus.REQUEUED}:
+                self._log(f"  Merge {merge_result.status.value}: {candidate.work_item_id[:12]}")
                 if merge_result.status is MergeStatus.FAILED:
                     self._work_item_repo.set_status(
                         candidate.work_item_id,
@@ -1319,8 +1810,17 @@ class OrchestratorController:
     def _batch_limit(self, config: Mapping[str, object]) -> int:
         resources_cfg = _nested_mapping_get(config, ("resources",))
         return _as_int(
-            resources_cfg.get("max_light_verification") if resources_cfg is not None else None,
-            default=2,
+            resources_cfg.get("max_concurrent_work_items") if resources_cfg is not None else None,
+            default=8,
+            minimum=1,
+        )
+
+    def _parallel_workers(self, config: Mapping[str, object]) -> int:
+        """Return the number of parallel dispatch workers for the thread pool."""
+        resources_cfg = _nested_mapping_get(config, ("resources",))
+        return _as_int(
+            resources_cfg.get("max_parallel_dispatch") if resources_cfg is not None else None,
+            default=6,
             minimum=1,
         )
 
@@ -1353,25 +1853,71 @@ class OrchestratorController:
         work_item: WorkItem,
         decision: EscalationDecision,
         attempt_number: int,
+        workspace_dir: Path | None = None,
     ) -> str:
         scope = ", ".join(work_item.scope)
         dependencies = ", ".join(work_item.dependencies) if work_item.dependencies else "(none)"
         constraint_ids = ", ".join(
             constraint.id for constraint in work_item.constraint_envelope.constraints
         )
-        return (
-            f"Role: {ROLE_IMPLEMENTER}\n"
-            f"Provider: {decision.provider}\n"
-            f"Model: {decision.model}\n"
-            f"Attempt: {attempt_number}\n"
-            f"WorkItemId: {work_item.id}\n"
-            f"Title: {work_item.title}\n"
-            f"Description: {work_item.description}\n"
-            f"Scope: {scope}\n"
-            f"Dependencies: {dependencies}\n"
-            f"Constraints: {constraint_ids}\n"
-            "Return only a unified git patch."
-        )
+
+        # --- System instructions ---
+        system_lines = [
+            "You are an IMPLEMENTATION agent. Your sole job is to produce "
+            "working code that satisfies the task below.",
+            "",
+            "WORKFLOW — follow these steps IN ORDER:",
+            "1. SCAN (≤2 min): Read the design_document.md and a few key source "
+            "   files to understand the codebase structure. Do NOT exhaustively "
+            "   explore every file.",
+            "2. PLAN (≤1 min): Decide which files to create or modify and what "
+            "   each change should contain.",
+            "3. IMPLEMENT (majority of time): Use the Write tool to create new "
+            "   files and the Edit tool to modify existing files. Produce real, "
+            "   working code — not summaries, analyses, or explanations.",
+            "4. VERIFY: Run any existing tests (e.g., `pytest`) to confirm your "
+            "   changes work.",
+            "",
+            "CRITICAL RULES:",
+            "- You MUST call Write or Edit to produce code. A run that only "
+            "  reads files is a FAILURE.",
+            "- Spend at most 20% of your time reading. Spend at least 80% writing.",
+            "- If you are unsure what to write, write your best implementation. "
+            "  An imperfect implementation is better than no implementation.",
+            "- Do NOT ask for clarification. Do NOT explain what you would do. "
+            "  Just implement it.",
+        ]
+
+        if workspace_dir is not None:
+            system_lines.extend([
+                "",
+                "WORKSPACE: You are in an isolated git worktree.",
+                "All file modifications MUST stay within the current working "
+                "directory. Do NOT access files outside of it.",
+            ])
+        else:
+            system_lines.extend([
+                "",
+                "OUTPUT: Return a unified git patch (diff format).",
+            ])
+
+        # --- Task specification ---
+        task_lines = [
+            "",
+            "═══ TASK ═══",
+            f"Title: {work_item.title}",
+            f"Description: {work_item.description}",
+            f"Scope files: {scope}",
+            f"Dependencies: {dependencies}",
+            f"Constraints: {constraint_ids}",
+            f"Attempt: {attempt_number}",
+            f"WorkItemId: {work_item.id}",
+            "",
+            "Implement the above requirement now. Start scanning, "
+            "then write the code.",
+        ]
+
+        return "\n".join(system_lines + task_lines)
 
     def _mock_patch_for_work_item(self, work_item: WorkItem) -> str:
         module_suffix = self._module_suffix(work_item)

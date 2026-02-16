@@ -97,6 +97,8 @@ class ProviderSettings(TypedDict, total=False):
     model_architect: str
     max_concurrent: int
     requests_per_minute: int
+    timeout_seconds: int
+    triage_timeout_seconds: int
 
 
 class ProvidersConfig(TypedDict):
@@ -109,6 +111,8 @@ class ProvidersConfig(TypedDict):
 
 class ResourcesConfig(TypedDict):
     orchestrator_cores: int
+    max_concurrent_work_items: int
+    max_parallel_dispatch: int
     max_heavy_verification: int
     max_light_verification: int
     ram_headroom_mb: int
@@ -193,7 +197,7 @@ DEFAULT_CONFIG: Final[OrchestratorConfig] = {
         "schema_version": ConfigSchemaVersion,
     },
     "providers": {
-        "default": "anthropic",
+        "default": "tool",
         "openai": {
             "api_key_env": "NEXUS_OPENAI_API_KEY",
         },
@@ -201,10 +205,12 @@ DEFAULT_CONFIG: Final[OrchestratorConfig] = {
             "api_key_env": "NEXUS_ANTHROPIC_API_KEY",
         },
         "local": {},
-        "tool": {},
+        "tool": {"timeout_seconds": 600},
     },
     "resources": {
         "orchestrator_cores": 2,
+        "max_concurrent_work_items": 8,
+        "max_parallel_dispatch": 6,
         "max_heavy_verification": 3,
         "max_light_verification": 8,
         "ram_headroom_mb": 6144,
@@ -689,6 +695,8 @@ def _validate_provider_settings(
         "model_architect",
         "max_concurrent",
         "requests_per_minute",
+        "timeout_seconds",
+        "triage_timeout_seconds",
     }
     _reject_unknown_keys(payload, allowed, path, issues)
     if require_api_key:
@@ -730,6 +738,26 @@ def _validate_provider_settings(
         if parsed_requests_per_minute is not None:
             out["requests_per_minute"] = parsed_requests_per_minute
 
+    if "timeout_seconds" in payload:
+        parsed_timeout = _as_int(
+            payload["timeout_seconds"],
+            _join(path, "timeout_seconds"),
+            issues,
+            minimum=30,
+        )
+        if parsed_timeout is not None:
+            out["timeout_seconds"] = parsed_timeout
+
+    if "triage_timeout_seconds" in payload:
+        parsed_triage_timeout = _as_int(
+            payload["triage_timeout_seconds"],
+            _join(path, "triage_timeout_seconds"),
+            issues,
+            minimum=5,
+        )
+        if parsed_triage_timeout is not None:
+            out["triage_timeout_seconds"] = parsed_triage_timeout
+
     return out
 
 
@@ -742,6 +770,8 @@ def _validate_resources(
 ) -> dict[str, Any]:
     allowed = {
         "orchestrator_cores",
+        "max_concurrent_work_items",
+        "max_parallel_dispatch",
         "max_heavy_verification",
         "max_light_verification",
         "ram_headroom_mb",
@@ -755,6 +785,8 @@ def _validate_resources(
     out: dict[str, Any] = {}
     minimums: dict[str, int] = {
         "orchestrator_cores": 1,
+        "max_concurrent_work_items": 1,
+        "max_parallel_dispatch": 1,
         "max_heavy_verification": 1,
         "max_light_verification": 1,
         "ram_headroom_mb": 1,

@@ -31,6 +31,7 @@ from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from hashlib import sha256
+from pathlib import Path
 from typing import TYPE_CHECKING, Protocol, TypeAlias, TypeVar, runtime_checkable
 
 from nexus_orchestrator.domain import ids
@@ -138,6 +139,7 @@ class DispatchRequest:
     budget: DispatchBudget = field(default_factory=DispatchBudget)
     idempotency_key: str | None = None
     metadata: Mapping[str, object] = field(default_factory=dict)
+    workspace_dir: Path | None = None
 
     def __post_init__(self) -> None:
         self.run_id = _validate_non_empty_str(self.run_id, "run_id")
@@ -156,6 +158,8 @@ class DispatchRequest:
         if self.idempotency_key is not None:
             self.idempotency_key = _validate_non_empty_str(self.idempotency_key, "idempotency_key")
         self.metadata = dict(self.metadata)
+        if self.workspace_dir is not None and not isinstance(self.workspace_dir, Path):
+            raise ValueError("workspace_dir must be a Path or None")
 
 
 @dataclass(slots=True)
@@ -455,6 +459,8 @@ class DispatchController:
         last_error: Exception | None = None
 
         if self._persistence is not None and self._persistence.persist_in_progress:
+            # Pass attempts=1 as fallback; _persist_attempt will prefer
+            # request.metadata["attempt_number"] when available.
             self._persist_attempt(
                 attempt_id=attempt_id,
                 request=request,
@@ -514,6 +520,7 @@ class DispatchController:
                                 user_prompt=request.prompt,
                                 idempotency_key=provider_idempotency_key,
                                 metadata=provider_metadata,
+                                workspace_dir=request.workspace_dir,
                             )
                             response = await _await_with_cancellation(
                                 _call_provider(
@@ -803,11 +810,21 @@ class DispatchController:
         if self._persistence is None:
             return
 
+        # Use the controller-provided attempt_number (which accounts for
+        # previous attempts across dispatch cycles on resume) instead of the
+        # internal retry counter, to avoid UNIQUE(work_item_id, iteration)
+        # conflicts when a work item is re-dispatched after crash recovery.
+        meta_iteration = request.metadata.get("attempt_number")
+        iteration = (
+            int(meta_iteration)
+            if isinstance(meta_iteration, int) and meta_iteration >= 1
+            else max(1, attempts)
+        )
         attempt = Attempt(
             id=attempt_id,
             work_item_id=request.work_item_id,
             run_id=request.run_id,
-            iteration=max(1, attempts),
+            iteration=iteration,
             provider=provider,
             model=model,
             role=request.role,

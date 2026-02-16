@@ -31,7 +31,7 @@ schema_version = 1
 
 # ---------- Provider Routing ----------
 [providers]
-default = "anthropic"  # "openai" | "anthropic" | "local"
+default = "tool"  # "openai" | "anthropic" | "local" | "tool"
 
 [providers.openai]
 api_key_env = "NEXUS_OPENAI_API_KEY"
@@ -47,10 +47,18 @@ model_architect = "claude-opus-4-6"
 # max_concurrent = 10
 # requests_per_minute = 30
 
+[providers.tool]
+timeout_seconds = 600
+triage_timeout_seconds = 20
+
 # ---------- Resource Governor ----------
 [resources]
 # CPU cores reserved for orchestrator (rest available for verification)
 orchestrator_cores = 2
+# Max work items dispatched in a single batch
+max_concurrent_work_items = 8
+# Max parallel dispatch threads
+max_parallel_dispatch = 6
 # Max concurrent heavy verification jobs (build + full test)
 max_heavy_verification = 3
 # Max concurrent light verification jobs (lint, format, typecheck)

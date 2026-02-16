@@ -2,8 +2,8 @@
 
 File: src/nexus_orchestrator/ui/tui/screens/plan_dialog.py
 
-Replaces the hardcoded "plan samples/specs/minimal_design_doc.md --mock" with
-a modal that shows recent files and an input field for a custom path.
+Shows a modal with recent files and an input field for a custom path.
+Submits a real (non-mock) plan command.
 """
 
 from __future__ import annotations
@@ -131,7 +131,7 @@ class PlanDialog(ModalScreen[str | None]):
                 placeholder="path/to/spec.md",
                 id="plan-dialog-input",
             )
-            yield Static("Flags: --mock (always appended in v1)", id="plan-dialog-flags")
+            yield Static("Runs a real execution after planning", id="plan-dialog-flags")
 
     def on_mount(self) -> None:
         self.query_one("#plan-dialog-input", Input).focus()
@@ -154,7 +154,7 @@ class PlanDialog(ModalScreen[str | None]):
     def _submit_spec(self, spec_path: str) -> None:
         """Save recent and dismiss with the command."""
         _save_recent_spec(spec_path)
-        self.dismiss(f"/run plan {spec_path} --mock")
+        self.dismiss(f"/run plan {spec_path}")
 
     def action_cancel(self) -> None:
         self.dismiss(None)

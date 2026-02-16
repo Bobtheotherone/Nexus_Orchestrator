@@ -41,7 +41,11 @@ class ComposerInput(Input):
         self._history_index = -1
 
     def on_key(self, event: events.Key) -> None:
-        """Handle Up/Down for command history navigation."""
+        """Handle Up/Down for command history navigation.
+
+        All other keys are delegated to the parent Input widget so that
+        normal character input works correctly.
+        """
         if event.key == "up":
             event.prevent_default()
             if not self._history:

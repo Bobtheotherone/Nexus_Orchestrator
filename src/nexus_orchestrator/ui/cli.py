@@ -499,7 +499,7 @@ def _cmd_plan(args: argparse.Namespace) -> int:
         renderer.section("Errors:")
         renderer.items(list(compilation.errors))
 
-    renderer.next_steps([f"nexus run {spec_display} --mock"])
+    renderer.next_steps([f"nexus run {spec_display}"])
     return exit_code
 
 

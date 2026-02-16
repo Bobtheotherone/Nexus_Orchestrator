@@ -178,6 +178,9 @@ def test_config_model_overrides_affect_role_routing_without_code_edits(tmp_path:
     _write_config(
         config_path,
         """
+[providers]
+default = "openai"
+
 [providers.openai]
 model_code = "gpt-4.1-mini"
 model_architect = "gpt-5"

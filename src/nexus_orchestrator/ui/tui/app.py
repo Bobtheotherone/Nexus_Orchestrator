@@ -34,6 +34,8 @@ from nexus_orchestrator.ui.tui.screens.help import (
     HelpScreen,
 )
 from nexus_orchestrator.ui.tui.screens.plan_dialog import PlanDialog
+from nexus_orchestrator.ui.tui.screens.progress_dialog import ProgressDialog
+from nexus_orchestrator.ui.tui.screens.run_after_plan_dialog import RunAfterPlanDialog
 from nexus_orchestrator.ui.tui.state import AppState, EventKind
 from nexus_orchestrator.ui.tui.widgets.composer import Composer
 from nexus_orchestrator.ui.tui.widgets.sidebar import SidebarWidget
@@ -367,6 +369,29 @@ class NexusTUI(App[int]):
                     self._state.transcript.pop()
                     self.exit(0)
                     return
+                if last.text.startswith("__PLAN_COMPLETE__"):
+                    spec_path = last.text[len("__PLAN_COMPLETE__"):]
+                    self._state.transcript.pop()
+                    self.push_screen(
+                        RunAfterPlanDialog(spec_path),
+                        callback=self._on_run_after_plan_result,
+                    )
+                    return
+                if last.text == "__SHOW_PROGRESS__":
+                    self._state.transcript.pop()
+                    from pathlib import Path
+
+                    state_db_path = self._state.workspace_path or "."
+                    db_path = Path(state_db_path) / "state" / "nexus.sqlite"
+                    self.push_screen(
+                        ProgressDialog(state_db_path=db_path),
+                        callback=self._on_progress_dialog_result,
+                    )
+                    return
+
+        # Snapshot current focus BEFORE updating widgets, so we can
+        # restore it if a widget update inadvertently steals focus.
+        _prev_focused = self.focused
 
         # Update transcript
         self._sync_transcript()
@@ -392,11 +417,25 @@ class NexusTUI(App[int]):
         except NoMatches:
             pass
 
+        # Focus guard: if the composer input had focus before the update
+        # and something stole it (e.g. RichLog auto_scroll, spinner toggle),
+        # restore it immediately so keystrokes aren't lost.
+        from nexus_orchestrator.ui.tui.widgets.composer import ComposerInput
+
+        if isinstance(_prev_focused, ComposerInput) and self.focused is not _prev_focused:
+            _prev_focused.focus()
+
     # Track how many events we've rendered
     _rendered_event_count: int = 0
 
     def _sync_transcript(self) -> None:
-        """Sync transcript widget with state — only append new events."""
+        """Sync transcript widget with state — only append new events.
+
+        Handles the deque wrap-around case: when the state deque (maxlen=5000)
+        drops old events, new_count falls below _rendered_event_count.  In that
+        case we clear the widget and re-render the tail of the deque so new
+        output keeps flowing — just like a normal terminal scrollback.
+        """
         try:
             transcript = self.query_one(TranscriptWidget)
         except NoMatches:
@@ -406,12 +445,23 @@ class NexusTUI(App[int]):
         new_count = len(events)
 
         if new_count == 0 and self._rendered_event_count > 0:
-            # Cleared
+            # Explicitly cleared
             transcript.clear()
             self._rendered_event_count = 0
             return
 
-        # Append only new events
+        if new_count < self._rendered_event_count:
+            # Deque wrapped — old events were evicted.  Clear the widget and
+            # re-render only the most recent portion to stay within buffer.
+            transcript.clear()
+            # Show the last _MAX_TAIL lines to avoid a heavy full re-render.
+            _MAX_TAIL = 500
+            tail = events[-_MAX_TAIL:] if len(events) > _MAX_TAIL else events
+            transcript.append_events(tail)
+            self._rendered_event_count = new_count
+            return
+
+        # Normal path — append only new events
         if new_count > self._rendered_event_count:
             new_events = events[self._rendered_event_count:]
             transcript.append_events(new_events)
@@ -437,6 +487,7 @@ class NexusTUI(App[int]):
 
         crash_data = load_crash_report()
         if crash_data:
+            self._has_crash_banner = True
             yield CrashRecoveryBanner(crash_data)
 
         with Horizontal(id="main-area"):
@@ -499,7 +550,19 @@ class NexusTUI(App[int]):
         self, event: SidebarWidget.QuickActionActivated
     ) -> None:
         """Quick action button pressed."""
-        if event.needs_args:
+        if event.command == "/progress":
+            # "Progress..." — open ECO selection dialog
+            state_db_path = self._controller.state.workspace_path
+            if not state_db_path:
+                state_db_path = "."
+            from pathlib import Path
+
+            db_path = Path(state_db_path) / "state" / "nexus.sqlite"
+            self.push_screen(
+                ProgressDialog(state_db_path=db_path),
+                callback=self._on_progress_dialog_result,
+            )
+        elif event.needs_args:
             # "Plan..." — open dialog with callback (NOT push_screen_wait,
             # which requires a Textual worker context)
             self.push_screen(PlanDialog(), callback=self._on_plan_dialog_result)
@@ -508,6 +571,16 @@ class NexusTUI(App[int]):
 
     async def _on_plan_dialog_result(self, result: str | None) -> None:
         """Callback from PlanDialog — execute the plan command if not cancelled."""
+        if result:
+            await self._controller.execute_command(result)
+
+    async def _on_progress_dialog_result(self, result: str | None) -> None:
+        """Callback from ProgressDialog — execute the resume command if not cancelled."""
+        if result:
+            await self._controller.execute_command(result)
+
+    async def _on_run_after_plan_result(self, result: str | None) -> None:
+        """Callback from RunAfterPlanDialog — execute the run command if not cancelled."""
         if result:
             await self._controller.execute_command(result)
 
@@ -616,16 +689,17 @@ class NexusTUI(App[int]):
     # Crash recovery key handler
     # ------------------------------------------------------------------
 
+    # Fast flag — avoids a DOM query + exception on every keypress.
+    _has_crash_banner: bool = False
+
     def on_key(self, event: object) -> None:
-        """Handle crash banner keys."""
+        """Handle crash banner keys (only when a banner is present)."""
+        if not self._has_crash_banner:
+            return
+
         from textual import events as _events
 
         if not isinstance(event, _events.Key):
-            return
-
-        try:
-            self.query_one("#crash-banner", CrashRecoveryBanner)
-        except NoMatches:
             return
 
         if event.key == "v":
@@ -651,6 +725,7 @@ class NexusTUI(App[int]):
     def _dismiss_crash_banner(self) -> None:
         from nexus_orchestrator.ui.crash_report import clear_crash_report
 
+        self._has_crash_banner = False
         clear_crash_report()
         try:
             banner = self.query_one("#crash-banner", CrashRecoveryBanner)

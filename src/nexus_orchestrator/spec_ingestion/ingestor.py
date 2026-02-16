@@ -87,6 +87,15 @@ _REQUIREMENT_REF_RE: Final[re.Pattern[str]] = re.compile(r"[A-Za-z][A-Za-z0-9-]*
 _VALIDATION_TIMESTAMP: Final[datetime] = datetime(2026, 1, 1, tzinfo=UTC)
 
 
+@dataclass(frozen=True, slots=True)
+class ExtractionInfo:
+    """Metadata about the extraction strategy used for flexible ingestion."""
+
+    count: int
+    strategy: str
+    confidence: float
+
+
 class SpecIngestError(Exception):
     """Structured ingestion validation failure."""
 
@@ -160,18 +169,46 @@ class _ParsedSource:
     global_acceptance: list[str] = field(default_factory=list)
 
 
-def ingest_spec(spec_path: Path, additional_sources: Sequence[Path] | None = None) -> SpecMap:
+def ingest_spec(
+    spec_path: Path,
+    additional_sources: Sequence[Path] | None = None,
+    *,
+    strict_requirements: bool = False,
+    metadata_out: dict[str, object] | None = None,
+) -> SpecMap:
     """
     Ingest one or more markdown specs into a deterministic ``SpecMap``.
 
     Merge order is deterministic: primary spec first, then ``additional_sources``
     sorted lexicographically by normalized path.
+
+    When *strict_requirements* is False (the default), arbitrary design
+    documents are accepted.  If the strict parser finds no REQ-XXXX
+    formatted requirements, the multi-stage requirements extractor is
+    used as a fallback so that any freeform document can be planned.
+
+    When *metadata_out* is provided, extraction metadata (strategy,
+    confidence, count) is attached under the ``"extraction_info"`` key.
     """
 
     ordered_sources = _resolve_sources(spec_path, additional_sources)
     parsed_sources = [_parse_source(path) for path in ordered_sources]
     merged = _merge_sources(parsed_sources)
-    _validate_cross_references(merged, ordered_sources[0])
+
+    # --- Flexible fallback: use the multi-stage extractor if strict ---
+    # --- parsing found no requirements and we're in flexible mode.  ---
+    if not merged.requirements and not strict_requirements:
+        extraction_result = _flexible_extract(ordered_sources[0])
+        for req in extraction_result.requirements:
+            merged.requirements[req.req_id] = req
+        if metadata_out is not None:
+            metadata_out["extraction_info"] = ExtractionInfo(
+                count=len(extraction_result.requirements),
+                strategy=extraction_result.strategy,
+                confidence=extraction_result.confidence,
+            )
+
+    _validate_cross_references(merged, ordered_sources[0], strict=strict_requirements)
     spec_map = _to_spec_map(merged, ordered_sources)
 
     try:
@@ -755,8 +792,61 @@ def _merge_sources(parsed_sources: Sequence[_ParsedSource]) -> _ParsedSource:
     return merged
 
 
-def _validate_cross_references(merged: _ParsedSource, primary_path: Path) -> None:
-    if not merged.requirements:
+# ---------------------------------------------------------------------------
+# Flexible extraction fallback
+# ---------------------------------------------------------------------------
+
+
+@dataclass(slots=True)
+class _FlexibleResult:
+    requirements: list[_RequirementDraft]
+    strategy: str
+    confidence: float
+
+
+def _flexible_extract(primary_path: Path) -> _FlexibleResult:
+    """Use the multi-stage requirements extractor for freeform documents."""
+    from nexus_orchestrator.planning.requirements_extractor import extract_requirements
+
+    result = extract_requirements(primary_path)
+
+    drafts: list[_RequirementDraft] = []
+    for req in result.requirements:
+        nfr_tags: list[str] = []
+        if req.type == "nonfunctional":
+            nfr_tags = ["nfr"]
+
+        source_line = 1
+        if isinstance(req.source, dict):
+            raw_line = req.source.get("line")
+            if isinstance(raw_line, int) and raw_line >= 1:
+                source_line = raw_line
+
+        drafts.append(
+            _RequirementDraft(
+                req_id=req.id,
+                statement=req.text,
+                acceptance_criteria=list(req.acceptance_criteria),
+                nfr_tags=nfr_tags,
+                source=SourceLocation(
+                    path=_display_path(primary_path),
+                    section="Extracted",
+                    line=source_line,
+                ),
+            )
+        )
+
+    return _FlexibleResult(
+        requirements=drafts,
+        strategy=result.used_strategy,
+        confidence=result.confidence,
+    )
+
+
+def _validate_cross_references(
+    merged: _ParsedSource, primary_path: Path, *, strict: bool = True
+) -> None:
+    if not merged.requirements and strict:
         raise SpecIngestError(
             path=primary_path,
             line=1,
@@ -870,4 +960,4 @@ def _display_path(path: Path) -> str:
     return resolved.as_posix()
 
 
-__all__ = ["SpecIngestError", "ingest_spec"]
+__all__ = ["ExtractionInfo", "SpecIngestError", "ingest_spec"]
